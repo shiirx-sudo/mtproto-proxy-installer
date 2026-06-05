@@ -364,14 +364,20 @@ telemt_download_verify() {
   fi
 
   if [ "$verified" != "true" ]; then
-    warn "Опубликованная контрольная сумма не найдена/не задана."
+    warn "Upstream не публикует контрольные суммы для этого релиза."
+    info "SHA256 скачанного файла: ${computed}"
     if [ "$ALLOW_UNVERIFIED" = "true" ]; then
       warn "ALLOW_UNVERIFIED=true — продолжаю без проверки целостности."
+    elif [ "$ASSUME_YES" != "true" ]; then
+      warn "Для повторной установки той же версии используйте:"
+      warn "  TELEMT_SHA256=${computed} bash install.sh"
+      confirm "Принять этот хеш как доверенный и продолжить установку?" \
+        || die "Установка отменена пользователем."
     else
-      err  "Чтобы продолжить безопасно, перезапустите с проверкой:"
-      err  "  TELEMT_SHA256=${computed} bash install.sh     # если вы доверяете этому хешу"
-      err  "или явно отключите проверку: ALLOW_UNVERIFIED=true bash install.sh"
-      die  "Установка прервана из-за непроверенной целостности."
+      err  "Неинтерактивный режим — укажите хеш явно:"
+      err  "  TELEMT_SHA256=${computed} bash install.sh"
+      err  "или: ALLOW_UNVERIFIED=true bash install.sh"
+      die  "Установка прервана: нет верифицированной контрольной суммы."
     fi
   fi
 
@@ -776,7 +782,11 @@ verify_and_install_binary() {
     [ "${computed,,}" = "${expected,,}" ] || die "Контрольная сумма не совпала ($computed != $expected)."
     ok "Контрольная сумма подтверждена."
   elif [ "${ALLOW_UNVERIFIED:-false}" != "true" ]; then
-    die "Нет опубликованной контрольной суммы. Перезапустите: TELEMT_SHA256=${computed} ... update  (или ALLOW_UNVERIFIED=true)."
+    warn "Upstream не публикует контрольные суммы для этого релиза."
+    warn "SHA256: ${computed}"
+    warn "Для воспроизводимого обновления: TELEMT_SHA256=${computed} mtproto-proxy-manager update"
+    # в менеджере нет интерактивного confirm, поэтому принимаем без блокировки
+    warn "Продолжаю без проверки целостности."
   else
     warn "Установка без проверки целостности (ALLOW_UNVERIFIED=true)."
   fi

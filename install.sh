@@ -687,7 +687,7 @@ services:
       nofile: { soft: 65536, hard: 65536 }
     network_mode: host
     volumes:
-      - ${CONFIG_PATH}:/app/config.toml:ro
+      - ${CONFIG_PATH}:/app/config/config.toml:ro
 EOF
   chmod 600 "${CONF_DIR}/docker-compose.yml"
   info "Сборка и запуск контейнера (может занять время — сборка из исходников Rust)..."

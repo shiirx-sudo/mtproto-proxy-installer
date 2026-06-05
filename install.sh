@@ -546,6 +546,20 @@ EOF
 # ----------------------------------------------------------------------------
 # Firewall
 # ----------------------------------------------------------------------------
+iptables_persist() {
+  if command -v netfilter-persistent >/dev/null 2>&1; then
+    netfilter-persistent save >/dev/null 2>&1 \
+      && ok "iptables: правила сохранены (netfilter-persistent)." \
+      || warn "netfilter-persistent save завершился с ошибкой."
+  else
+    info "Устанавливаю iptables-persistent для сохранения правил..."
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iptables-persistent >/dev/null 2>&1 \
+      && netfilter-persistent save >/dev/null 2>&1 \
+      && ok "iptables: правила сохранены (iptables-persistent)." \
+      || warn "Не удалось установить iptables-persistent — правило может не пережить перезагрузку."
+  fi
+}
+
 setup_firewall() {
   FW_BACKEND="none"
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
@@ -562,11 +576,11 @@ setup_firewall() {
     ok "firewalld: разрешён ${PORT}/tcp."
   elif command -v iptables >/dev/null 2>&1; then
     FW_BACKEND="iptables"
-    info "Добавляю ACCEPT-правило iptables для ${PORT}/tcp (без сброса существующих правил)."
+    info "Добавляю ACCEPT-правило iptables для ${PORT}/tcp..."
     if ! iptables -C INPUT -p tcp --dport "${PORT}" -j ACCEPT 2>/dev/null; then
       iptables -I INPUT -p tcp --dport "${PORT}" -j ACCEPT
     fi
-    warn "Правило iptables может не сохраниться после перезагрузки — настройте netfilter-persistent при необходимости."
+    iptables_persist
   else
     warn "Файрвол не обнаружен. Откройте ${PORT}/tcp вручную, если используете фильтрацию."
   fi
@@ -866,7 +880,8 @@ cmd_uninstall() {
   case "${FW_BACKEND:-none}" in
     ufw)       ufw delete allow "${PORT}/tcp" >/dev/null 2>&1 || true ;;
     firewalld) firewall-cmd --permanent --remove-port="${PORT}/tcp" >/dev/null 2>&1 || true; firewall-cmd --reload >/dev/null 2>&1 || true ;;
-    iptables)  iptables -D INPUT -p tcp --dport "${PORT}" -j ACCEPT 2>/dev/null || true ;;
+    iptables)  iptables -D INPUT -p tcp --dport "${PORT}" -j ACCEPT 2>/dev/null || true
+               command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1 || true ;;
   esac
   ok "Файрвол-правило для ${PORT}/tcp удалено (если было)."
 

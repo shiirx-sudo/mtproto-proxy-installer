@@ -18,7 +18,7 @@ set -euo pipefail
 # Constants & defaults (overridable via environment)
 # ----------------------------------------------------------------------------
 TELEMT_REPO="${TELEMT_REPO:-telemt/telemt}"
-TELEMT_VERSION="${TELEMT_VERSION:-3.3.28}"   # pinned by default; updatable later
+TELEMT_VERSION="${TELEMT_VERSION:-3.4.13}"   # pinned by default; updatable later
 TELEMT_SHA256="${TELEMT_SHA256:-}"           # operator-pinned hash (strongest)
 ALLOW_UNVERIFIED="${ALLOW_UNVERIFIED:-false}"
 

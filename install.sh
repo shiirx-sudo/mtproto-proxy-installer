@@ -218,16 +218,15 @@ check_port_free() {
   fi
 
   local choice
-  choice="$(ask "Действие: [k] остановить занявший сервис / [p] другой порт / [q] выход" "q")"
+  choice="$(ask "Действие: [d] удалить занявший сервис / [p] другой порт / [q] выход" "q")"
   case "$choice" in
-    k|K) stop_port_occupant; check_port_free ;;
+    d|D) delete_port_occupant; check_port_free ;;
     p|P) PORT="$(ask "Новый порт" "8443")"; check_port_free ;;
     *)   die "Выход. Освободите порт вручную и перезапустите установщик." ;;
   esac
 }
 
-stop_port_occupant() {
-  # User-initiated (not automatic): stop the service/process holding the port.
+delete_port_occupant() {
   local pids
   pids="$(ss -lntpH "sport = :${PORT}" 2>/dev/null | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u)"
   if [ -z "$pids" ]; then
@@ -235,33 +234,94 @@ stop_port_occupant() {
     return
   fi
 
-  warn "ВНИМАНИЕ: остановка займёт сервис, который СЕЙЧАС использует порт ${PORT}."
-  warn "Если через него (например xray) идёт ваш трафик — он прервётся. Убедитесь, что это безопасно."
-
-  local pid unit pname
+  local pid
   for pid in $pids; do
-    unit=""
-    [ -r "/proc/$pid/cgroup" ] && unit="$(grep -oE '[a-zA-Z0-9@._-]+\.service' "/proc/$pid/cgroup" | head -1 || true)"
+    local pname unit fragment binary pkg
     pname="$(ps -o comm= -p "$pid" 2>/dev/null || echo "pid $pid")"
 
-    if [ -n "$unit" ]; then
-      if confirm "Остановить systemd-сервис ${unit} (процесс ${pname}, pid ${pid})?"; then
-        if systemctl stop "$unit"; then
-          ok "Остановлен ${unit}."
-          if confirm "Отключить автозапуск ${unit}, чтобы он не занял порт после перезагрузки?"; then
-            systemctl disable "$unit" >/dev/null 2>&1 && ok "Автозапуск ${unit} отключён." || warn "Не удалось отключить автозапуск ${unit}."
-          fi
-        else
-          warn "Не удалось остановить ${unit}."
-        fi
+    # Determine systemd unit via cgroup
+    unit=""
+    [ -r "/proc/$pid/cgroup" ] && unit="$(grep -oE '[a-zA-Z0-9@._-]+\.service' "/proc/$pid/cgroup" | head -1 || true)"
+
+    if [ -z "$unit" ]; then
+      warn "Процесс '${pname}' (pid ${pid}) не управляется systemd."
+      warn "Установщик не может удалить его автоматически — завершите его вручную или выберите другой порт."
+      continue
+    fi
+
+    info "Процесс '${pname}' (pid ${pid}) → systemd-юнит: ${unit}"
+
+    fragment="$(systemctl show "$unit" --property=FragmentPath --value 2>/dev/null || true)"
+    binary="$(systemctl show "$unit" --property=ExecStart --value 2>/dev/null \
+              | sed -n 's/.*{ path=\([^ ;]*\).*/\1/p' | head -1 || true)"
+
+    info "  Unit-файл: ${fragment:-не определён}"
+    info "  Бинарник:  ${binary:-не определён}"
+
+    # Check if installed via dpkg
+    pkg=""
+    if [ -n "$binary" ] && command -v dpkg >/dev/null 2>&1; then
+      pkg="$(dpkg -S "$binary" 2>/dev/null | cut -d: -f1 | head -1 || true)"
+    fi
+
+    if [ -n "$pkg" ]; then
+      # Package-managed service — purge via apt to keep dpkg consistent
+      warn "Сервис ${unit} установлен из пакета '${pkg}' (dpkg -S ${binary})."
+      warn "Рекомендуется apt-get purge, чтобы не сломать базу dpkg."
+      if confirm "Выполнить: apt-get purge --autoremove ${pkg}?"; then
+        apt-get purge --autoremove -y "$pkg"
+        ok "Пакет '${pkg}' удалён."
       fi
     else
-      if confirm "Это не systemd-сервис. Отправить SIGTERM процессу ${pname} (pid ${pid})?"; then
-        kill -TERM "$pid" 2>/dev/null && ok "Сигнал TERM отправлен (pid ${pid})." || warn "Не удалось завершить pid ${pid}."
+      # Standalone installation (e.g. xray install-release.sh)
+      warn "Сервис ${unit} — standalone-установка (вне dpkg)."
+
+      if confirm "Остановить ${unit}?"; then
+        systemctl stop "$unit" 2>/dev/null && ok "Остановлен ${unit}." || warn "Не удалось остановить ${unit}."
+      fi
+
+      if confirm "Отключить автозапуск ${unit}?"; then
+        systemctl disable "$unit" >/dev/null 2>&1 && ok "Автозапуск ${unit} отключён." || warn "Не удалось отключить автозапуск ${unit}."
+      fi
+
+      if [ -n "$fragment" ] && [ -f "$fragment" ] && confirm "Удалить unit-файл ${fragment}?"; then
+        rm -f "$fragment"
+        ok "Удалён unit-файл: ${fragment}"
+      fi
+
+      if [ -n "$fragment" ]; then
+        local dropin
+        dropin="$(dirname "$fragment")/${unit}.d"
+        if [ -d "$dropin" ] && confirm "Удалить drop-in каталог ${dropin}?"; then
+          rm -rf "$dropin"
+          ok "Удалён drop-in каталог: ${dropin}"
+        fi
+      fi
+
+      systemctl daemon-reload
+      ok "daemon-reload выполнен."
+
+      if [ -n "$binary" ] && [ -f "$binary" ] && confirm "Удалить бинарник ${binary}?"; then
+        rm -f "$binary"
+        ok "Удалён бинарник: ${binary}"
+      fi
+
+      # xray-specific: offer to remove config/data directories
+      if echo "${binary}${unit}" | grep -qi xray; then
+        local xray_dirs=("/usr/local/etc/xray" "/etc/xray" "/usr/local/share/xray" "/var/log/xray")
+        local found_dirs=()
+        for d in "${xray_dirs[@]}"; do [ -d "$d" ] && found_dirs+=("$d"); done
+        if [ "${#found_dirs[@]}" -gt 0 ]; then
+          info "Обнаружены данные xray: ${found_dirs[*]}"
+          if confirm "Удалить конфиги и данные xray (${found_dirs[*]})?"; then
+            for d in "${found_dirs[@]}"; do rm -rf "$d" && ok "Удалено: $d"; done
+          fi
+        fi
       fi
     fi
   done
-  sleep 2
+
+  sleep 1
 }
 
 # ----------------------------------------------------------------------------

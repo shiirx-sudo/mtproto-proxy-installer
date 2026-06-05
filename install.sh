@@ -38,7 +38,7 @@ PROXY_USERNAME="user"                        # key in [access.users]
 
 # Defaults that the operator can change interactively or via env
 PORT="${PORT:-443}"
-MASK_DOMAIN="${MASK_DOMAIN:-www.cloudflare.com}"   # SNI / tls_domain to masquerade as
+MASK_DOMAIN="${MASK_DOMAIN:-vk.com}"   # SNI / tls_domain to masquerade as
 CONN_HOST="${CONN_HOST:-}"                    # IP or domain put into the link
 DEPLOY="${DEPLOY:-systemd}"                   # systemd | docker
 ENABLE_BBR="${ENABLE_BBR:-ask}"              # ask | true | false
@@ -148,13 +148,8 @@ gather_config() {
   [ -n "$pub_ip" ] && info "Определён внешний IP сервера: $pub_ip" || warn "Не удалось автоматически определить внешний IP."
   SERVER_IP="$pub_ip"
 
-  # --- Deployment mode ---
-  if [ "$ASSUME_YES" != "true" ] && [ "${DEPLOY_FORCED:-false}" != "true" ]; then
-    local m
-    m="$(ask "Режим развёртывания: systemd или docker" "$DEPLOY")"
-    case "$m" in systemd|docker) DEPLOY="$m";; *) warn "Неизвестно '$m', использую systemd"; DEPLOY="systemd";; esac
-  fi
-  ok "Режим: $DEPLOY"
+  # --- Deployment mode: always systemd (docker only via explicit --docker flag) ---
+  ok "Режим развёртывания: $DEPLOY"
 
   # --- Connection host (link address) ---
   echo
@@ -208,24 +203,65 @@ gather_config() {
 }
 
 check_port_free() {
-  local pid_line
-  pid_line="$(ss -lntpH "sport = :${PORT}" 2>/dev/null || true)"
-  if [ -n "$pid_line" ]; then
-    warn "Порт ${PORT} уже занят:"
-    echo "$pid_line" | sed 's/^/    /'
-    if [ "$ASSUME_YES" = "true" ]; then
-      die "Порт занят (неинтерактивный режим). Освободите порт или задайте PORT=другой."
-    fi
-    local choice
-    choice="$(ask "Выберите: [s]кип-проверку / [p]другой порт / [q]выход" "q")"
-    case "$choice" in
-      s|S) warn "Проверка порта пропущена по требованию пользователя." ;;
-      p|P) PORT="$(ask "Новый порт" "8443")"; check_port_free ;;
-      *)   die "Выход. Освободите порт вручную (автоматически чужие процессы не убиваются)." ;;
-    esac
-  else
+  local lines
+  lines="$(ss -lntpH "sport = :${PORT}" 2>/dev/null || true)"
+  if [ -z "$lines" ]; then
     ok "Порт ${PORT}/tcp свободен."
+    return
   fi
+
+  warn "Порт ${PORT} уже занят:"
+  echo "$lines" | sed 's/^/    /'
+
+  if [ "$ASSUME_YES" = "true" ]; then
+    die "Порт занят (неинтерактивный режим). Освободите порт или задайте PORT=другой."
+  fi
+
+  local choice
+  choice="$(ask "Действие: [k] остановить занявший сервис / [p] другой порт / [q] выход" "q")"
+  case "$choice" in
+    k|K) stop_port_occupant; check_port_free ;;
+    p|P) PORT="$(ask "Новый порт" "8443")"; check_port_free ;;
+    *)   die "Выход. Освободите порт вручную и перезапустите установщик." ;;
+  esac
+}
+
+stop_port_occupant() {
+  # User-initiated (not automatic): stop the service/process holding the port.
+  local pids
+  pids="$(ss -lntpH "sport = :${PORT}" 2>/dev/null | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u)"
+  if [ -z "$pids" ]; then
+    warn "Не удалось определить PID процесса на порту ${PORT} (запущено не от root?)."
+    return
+  fi
+
+  warn "ВНИМАНИЕ: остановка займёт сервис, который СЕЙЧАС использует порт ${PORT}."
+  warn "Если через него (например xray) идёт ваш трафик — он прервётся. Убедитесь, что это безопасно."
+
+  local pid unit pname
+  for pid in $pids; do
+    unit=""
+    [ -r "/proc/$pid/cgroup" ] && unit="$(grep -oE '[a-zA-Z0-9@._-]+\.service' "/proc/$pid/cgroup" | head -1 || true)"
+    pname="$(ps -o comm= -p "$pid" 2>/dev/null || echo "pid $pid")"
+
+    if [ -n "$unit" ]; then
+      if confirm "Остановить systemd-сервис ${unit} (процесс ${pname}, pid ${pid})?"; then
+        if systemctl stop "$unit"; then
+          ok "Остановлен ${unit}."
+          if confirm "Отключить автозапуск ${unit}, чтобы он не занял порт после перезагрузки?"; then
+            systemctl disable "$unit" >/dev/null 2>&1 && ok "Автозапуск ${unit} отключён." || warn "Не удалось отключить автозапуск ${unit}."
+          fi
+        else
+          warn "Не удалось остановить ${unit}."
+        fi
+      fi
+    else
+      if confirm "Это не systemd-сервис. Отправить SIGTERM процессу ${pname} (pid ${pid})?"; then
+        kill -TERM "$pid" 2>/dev/null && ok "Сигнал TERM отправлен (pid ${pid})." || warn "Не удалось завершить pid ${pid}."
+      fi
+    fi
+  done
+  sleep 2
 }
 
 # ----------------------------------------------------------------------------
@@ -804,8 +840,8 @@ main() {
   # crude flag parsing
   for arg in "$@"; do
     case "$arg" in
-      --docker) DEPLOY="docker"; DEPLOY_FORCED="true" ;;
-      --systemd) DEPLOY="systemd"; DEPLOY_FORCED="true" ;;
+      --docker) DEPLOY="docker" ;;
+      --systemd) DEPLOY="systemd" ;;
       --yes|-y) ASSUME_YES="true" ;;
       --bbr) ENABLE_BBR="true" ;;
       --no-bbr) ENABLE_BBR="false" ;;

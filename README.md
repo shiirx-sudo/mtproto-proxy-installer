@@ -76,7 +76,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/USER/REPO/main/install.sh)
 |---|---|---|
 | `PORT` | `443` | порт прослушивания |
 | `CONN_HOST` | автоопределение IP | адрес в ссылке (IP или домен) |
-| `MASK_DOMAIN` | `www.cloudflare.com` | маскировочный SNI (`tls_domain`) |
+| `MASK_DOMAIN` | `vk.com` | маскировочный SNI (`tls_domain`) |
 | `TELEMT_VERSION` | `3.3.28` | версия бэкенда |
 | `TELEMT_SHA256` | — | закрепить контрольную сумму (надёжнее всего) |
 | `ALLOW_UNVERIFIED` | `false` | разрешить установку без проверки целостности |

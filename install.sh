@@ -18,7 +18,8 @@ set -euo pipefail
 # Constants & defaults (overridable via environment)
 # ----------------------------------------------------------------------------
 TELEMT_REPO="${TELEMT_REPO:-telemt/telemt}"
-TELEMT_VERSION="${TELEMT_VERSION:-3.4.13}"   # pinned by default; updatable later
+TELEMT_VERSION="${TELEMT_VERSION:-}"         # auto-detect latest if not set; override via env
+TELEMT_FALLBACK_VERSION="3.4.13"            # used only when GitHub API is unreachable
 TELEMT_SHA256="${TELEMT_SHA256:-}"           # operator-pinned hash (strongest)
 ALLOW_UNVERIFIED="${ALLOW_UNVERIFIED:-false}"
 
@@ -120,6 +121,24 @@ install_deps() {
   apt-get update -qq
   apt-get install -y -qq curl jq tar openssl ca-certificates iproute2 >/dev/null
   ok "Зависимости установлены."
+}
+
+resolve_telemt_version() {
+  if [ -n "$TELEMT_VERSION" ]; then
+    info "Версия telemt задана вручную: ${TELEMT_VERSION}"
+    return
+  fi
+  info "Определяю последнюю версию telemt из GitHub API..."
+  local ver
+  ver="$(curl -fsS -m 10 "https://api.github.com/repos/${TELEMT_REPO}/releases/latest" 2>/dev/null \
+        | jq -r '.tag_name // empty' 2>/dev/null || true)"
+  if [ -n "$ver" ] && [ "$ver" != "null" ]; then
+    TELEMT_VERSION="$ver"
+    ok "Последняя версия telemt: ${TELEMT_VERSION}"
+  else
+    TELEMT_VERSION="$TELEMT_FALLBACK_VERSION"
+    warn "GitHub API недоступен — использую fallback: ${TELEMT_VERSION}"
+  fi
 }
 
 # ----------------------------------------------------------------------------
@@ -923,6 +942,7 @@ main() {
   detect_os
   detect_arch
   install_deps
+  resolve_telemt_version
   gather_config
 
   local secret; secret="$(gen_secret)"

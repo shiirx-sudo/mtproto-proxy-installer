@@ -546,27 +546,18 @@ EOF
 # ----------------------------------------------------------------------------
 # Firewall
 # ----------------------------------------------------------------------------
-iptables_persist() {
-  if command -v netfilter-persistent >/dev/null 2>&1; then
-    netfilter-persistent save >/dev/null 2>&1 \
-      && ok "iptables: правила сохранены (netfilter-persistent)." \
-      || warn "netfilter-persistent save завершился с ошибкой."
-  else
-    info "Устанавливаю iptables-persistent для сохранения правил..."
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iptables-persistent >/dev/null 2>&1 \
-      && netfilter-persistent save >/dev/null 2>&1 \
-      && ok "iptables: правила сохранены (iptables-persistent)." \
-      || warn "Не удалось установить iptables-persistent — правило может не пережить перезагрузку."
-  fi
-}
-
 setup_firewall() {
   FW_BACKEND="none"
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+  if command -v ufw >/dev/null 2>&1; then
+    # ufw установлен — использовать его всегда (активен или нет).
+    # iptables-persistent конфликтует с ufw и удаляет его; смешивать нельзя.
     FW_BACKEND="ufw"
-    info "Обнаружен активный ufw — открываю ${PORT}/tcp."
-    ufw allow "${PORT}/tcp" >/dev/null
     maybe_protect_ssh_ufw
+    if ! ufw status 2>/dev/null | grep -q "Status: active"; then
+      info "ufw установлен, но не активен — включаю."
+      ufw --force enable >/dev/null
+    fi
+    ufw allow "${PORT}/tcp" >/dev/null
     ok "ufw: разрешён ${PORT}/tcp."
   elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
     FW_BACKEND="firewalld"
@@ -580,7 +571,14 @@ setup_firewall() {
     if ! iptables -C INPUT -p tcp --dport "${PORT}" -j ACCEPT 2>/dev/null; then
       iptables -I INPUT -p tcp --dport "${PORT}" -j ACCEPT
     fi
-    iptables_persist
+    if command -v netfilter-persistent >/dev/null 2>&1; then
+      netfilter-persistent save >/dev/null 2>&1 \
+        && ok "iptables: правила сохранены (netfilter-persistent)." \
+        || warn "netfilter-persistent save завершился с ошибкой."
+    else
+      warn "netfilter-persistent не найден — правило iptables не переживёт перезагрузку."
+      warn "Установите вручную: apt-get install iptables-persistent && netfilter-persistent save"
+    fi
   else
     warn "Файрвол не обнаружен. Откройте ${PORT}/tcp вручную, если используете фильтрацию."
   fi

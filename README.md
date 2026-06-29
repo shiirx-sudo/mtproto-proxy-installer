@@ -200,3 +200,14 @@ APT_LOCK_TIMEOUT=1800 curl -fsSL https://raw.githubusercontent.com/shiirx-sudo/m
 ```
 
 Do not remove `/var/lib/dpkg/lock*` files manually.
+
+
+## v8 note
+
+Fixed a final cleanup bug under `set -u` where an unset temporary variable could produce:
+
+```text
+/root/mtg-install.sh: line 897: tmp: unbound variable
+```
+
+This happened after service installation/diagnostics and did not necessarily mean MTG or AmneziaWG failed.

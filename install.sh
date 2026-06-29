@@ -3,6 +3,8 @@
 # Optional: AmneziaWG VPN access, UFW firewall, automatic updates, two-stage reboot flow.
 set -Eeuo pipefail
 
+tmp=""
+
 wait_for_apt_locks() {
   local waited=0
   local max_wait="${APT_LOCK_TIMEOUT:-900}"
@@ -38,6 +40,13 @@ wait_for_apt_locks() {
 apt_get_safe() {
   wait_for_apt_locks
   DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get "$@"
+}
+
+safe_rm_tmp() {
+  local path="${1:-}"
+  [[ -n "$path" ]] || return 0
+  [[ "$path" == /tmp/* || "$path" == /var/tmp/* ]] || return 0
+  rm -rf "$path"
 }
 
 
@@ -476,7 +485,7 @@ download_and_install_binary() {
   local sums="mtg-${ver}-checksums.txt"
   local base="https://github.com/${MTG_REPO}/releases/download/${tag}"
   local tmp; tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"' RETURN
+  trap 'rm -rf "${tmp:-}"' RETURN
 
   info "Downloading ${asset} (${tag})"
   curl -fSL --retry 3 --retry-delay 2 -o "${tmp}/${asset}" "${base}/${asset}" \

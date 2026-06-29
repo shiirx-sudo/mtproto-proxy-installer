@@ -1,0 +1,6 @@
+*.env
+.env
+*.conf
+*.toml
+client_links.txt
+/root/awg-clients/

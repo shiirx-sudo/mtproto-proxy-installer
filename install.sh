@@ -1,988 +1,918 @@
 #!/usr/bin/env bash
-#
-# MTProto Proxy installer (DPI-resistant: Fake TLS `ee` / Secure `dd`)
-# Backend: telemt (https://github.com/telemt/telemt)
-#
-# One-command install:
-#   bash <(curl -fsSL https://raw.githubusercontent.com/USER/REPO/main/install.sh)
-#
-# This script is self-contained: it generates the config, the systemd unit
-# and the `mtproto-proxy-manager` management tool.
-#
-# It DOES NOT promise "undetectability". MTProto + Fake TLS *reduces* the
-# probability of DPI detection, it does not guarantee bypass. See README.
-#
-set -euo pipefail
+# install.sh — full production installer for Telegram MTProto proxy via mtg v2 FakeTLS
+# Optional: AmneziaWG VPN access, UFW firewall, automatic updates, two-stage reboot flow.
+set -Eeuo pipefail
 
-# ----------------------------------------------------------------------------
-# Constants & defaults (overridable via environment)
-# ----------------------------------------------------------------------------
-TELEMT_REPO="${TELEMT_REPO:-telemt/telemt}"
-TELEMT_VERSION="${TELEMT_VERSION:-}"         # auto-detect latest if not set; override via env
-TELEMT_FALLBACK_VERSION="3.4.13"            # used only when GitHub API is unreachable
-TELEMT_SHA256="${TELEMT_SHA256:-}"           # operator-pinned hash (strongest)
-ALLOW_UNVERIFIED="${ALLOW_UNVERIFIED:-false}"
+readonly MTG_REPO="9seconds/mtg"
+readonly BIN_PATH="/usr/local/bin/mtg"
+readonly CTL_PATH="/usr/local/bin/mtgctl"
+readonly CONFIG_PATH="/etc/mtg.toml"
+readonly SERVICE_PATH="/etc/systemd/system/mtg.service"
+readonly SERVICE_NAME="mtg"
+readonly RUN_USER="mtg"
+readonly RUN_GROUP="mtg"
+readonly STATE_DIR="/var/lib/mtg-installer"
+readonly PREPARED_MARKER="${STATE_DIR}/prepared.ok"
+readonly SELF_PATH="${STATE_DIR}/install.sh"
+readonly RESUME_SERVICE="/etc/systemd/system/mtg-installer-resume.service"
+readonly RESUME_SCRIPT="${STATE_DIR}/resume.sh"
+readonly MTG_UPDATE_SERVICE="/etc/systemd/system/mtg-auto-update.service"
+readonly MTG_UPDATE_TIMER="/etc/systemd/system/mtg-auto-update.timer"
+readonly AWG_CONFIG_DIR="/etc/amnezia/amneziawg"
+readonly AWG_CONFIG_PATH="${AWG_CONFIG_DIR}/awg0.conf"
+readonly AWG_CLIENT_DIR="/root/awg-clients"
 
-CONF_DIR="/etc/mtproto-proxy"
-CONFIG_PATH="${CONF_DIR}/telemt.toml"
-ENV_PATH="${CONF_DIR}/installer.env"
-LINKS_PATH="${CONF_DIR}/links.txt"
-BACKUP_DIR="${CONF_DIR}/backups"
-BIN_PATH="/usr/local/bin/telemt"
-MANAGER_PATH="/usr/local/bin/mtproto-proxy-manager"
-SERVICE_NAME="mtproto-proxy"
-UNIT_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
-PROXY_USER="mtproxy"
-PROXY_HOME="/var/lib/mtproto-proxy"
-API_ADDR="127.0.0.1:9091"
-PROXY_USERNAME="user"                        # key in [access.users]
-
-# Defaults that the operator can change interactively or via env
+ORIGINAL_ARGS=("$@")
+REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/shiirx-sudo/mtproto-proxy-installer/main}"
 PORT="${PORT:-443}"
-MASK_DOMAIN="${MASK_DOMAIN:-vk.com}"   # SNI / tls_domain to masquerade as
-CONN_HOST="${CONN_HOST:-}"                    # IP or domain put into the link
-DEPLOY="${DEPLOY:-systemd}"                   # systemd | docker
-ENABLE_BBR="${ENABLE_BBR:-ask}"              # ask | true | false
-INSECURE_DIAGNOSTIC_ONLY="${INSECURE_DIAGNOSTIC_ONLY:-false}"
-ASSUME_YES="${ASSUME_YES:-false}"
-PROTECT_SSH="${PROTECT_SSH:-ask}"
+MASK_DOMAIN="${MASK_DOMAIN:-${DOMAIN:-}}"
+RANDOM_MASK_DOMAIN=0
+PIN_VERSION="${MTG_VERSION:-v2.2.8}"
+ASSUME_YES=0
+MODE="install"        # prepare | full | install | resume-install | update | uninstall
+USE_LATEST=0
+SKIP_CHECKSUM=0
+AUTO_REBOOT=0
+REMOVE_EXISTING=0
+ENABLE_FIREWALL=0
+AUTO_UPDATES=0
+INSTALL_AWG=0
+AWG_PORT="${AWG_PORT:-443}"
+AWG_SUBNET="${AWG_SUBNET:-}"
+AWG_CLIENT_NAME="${AWG_CLIENT_NAME:-admin}"
+OS_ID=""
+OS_PRETTY=""
 
-# ----------------------------------------------------------------------------
-# Logging helpers
-# ----------------------------------------------------------------------------
-if [ -t 1 ]; then
-  C_RED=$'\033[31m'; C_GRN=$'\033[32m'; C_YEL=$'\033[33m'; C_CYN=$'\033[36m'; C_RST=$'\033[0m'; C_BLD=$'\033[1m'
-else
-  C_RED=""; C_GRN=""; C_YEL=""; C_CYN=""; C_RST=""; C_BLD=""
-fi
-info()  { printf '%s[*]%s %s\n' "$C_CYN" "$C_RST" "$*"; }
-ok()    { printf '%s[+]%s %s\n' "$C_GRN" "$C_RST" "$*"; }
-warn()  { printf '%s[!]%s %s\n' "$C_YEL" "$C_RST" "$*" >&2; }
-err()   { printf '%s[x]%s %s\n' "$C_RED" "$C_RST" "$*" >&2; }
-die()   { err "$*"; exit 1; }
+MASK_DOMAIN_CANDIDATES=(
+  "max.ru"
+  "storage.yandex.net"
+  "yastatic.net"
+  "ya.ru"
+  "vk.com"
+  "api.vk.com"
+  "userapi.com"
+  "vkuservideo.ru"
+  "cdnvideo.ru"
+  "okcdn.ru"
+  "hosting.reg.ru"
+  "cdn.ngenix.net"
+)
+
+c_reset=$'\033[0m'; c_red=$'\033[31m'; c_grn=$'\033[32m'; c_yel=$'\033[33m'; c_blu=$'\033[34m'; c_bld=$'\033[1m'
+info()  { printf '%s[*]%s %s\n' "$c_blu" "$c_reset" "$*"; }
+ok()    { printf '%s[+]%s %s\n' "$c_grn" "$c_reset" "$*"; }
+warn()  { printf '%s[!]%s %s\n' "$c_yel" "$c_reset" "$*" >&2; }
+die()   { printf '%s[x]%s %s\n' "$c_red" "$c_reset" "$*" >&2; exit 1; }
+
+usage() {
+  cat <<EOF
+${c_bld}MTG v2 FakeTLS MTProto proxy installer${c_reset}
+
+Recommended two-stage deployment:
+  sudo ./install.sh --full --random-mask-domain --port 443 --install-awg --enable-firewall --auto-updates --auto-reboot --remove-existing --yes
+
+If you do not want automatic reboot/resume:
+  sudo ./install.sh --prepare --remove-existing --auto-updates --yes
+  sudo reboot
+  sudo ./install.sh --mask-domain ya.ru --port 443 --install-awg --enable-firewall --auto-updates --yes
+
+Options:
+  --prepare             Update OS/dependencies, optionally remove old MTProto, then reboot/exit
+  --full                Prepare first, then resume installation after reboot when --auto-reboot is set
+  --resume-install      Internal mode used by reboot-resume service
+  --mask-domain <host>  FakeTLS/SNI mask domain, e.g. ya.ru
+  --domain <host>       Legacy alias for --mask-domain
+  --random-mask-domain  Pick a random mask domain from the built-in list
+  --port <port>         Public MTG TCP port, default 443
+  --version <tag>       Pin mtg version, default ${PIN_VERSION}
+  --latest              Resolve latest mtg release from GitHub API
+  --skip-checksum       Allow install if checksum file is unavailable/mismatched lookup
+  --install-awg         Install and configure AmneziaWG VPN access
+  --awg-port <port>     AmneziaWG UDP port, default ${AWG_PORT}; can share number 443 with MTG/TCP
+  --awg-subnet <CIDR>   AmneziaWG private subnet inside 10.0.0.0/8, e.g. 10.66.66.0/24
+  --awg-client <name>   First AmneziaWG client config name, default ${AWG_CLIENT_NAME}
+  --enable-firewall     Enable UFW: deny incoming; allow SSH, MTG TCP port, and AWG UDP port when enabled
+  --auto-updates        Enable unattended system updates + daily mtg update timer
+  --auto-reboot         In --prepare/--full mode: install resume service and reboot automatically
+  --remove-existing     Remove known existing MTProto/MTG installs before installing
+  -y, --yes             Non-interactive mode
+  --update              Update only mtg binary, keep config
+  --uninstall           Remove MTG service/binary/config/mtgctl and auto-update timer
+  -h, --help            Show help
+
+Environment variables: PORT, MASK_DOMAIN, DOMAIN, MTG_VERSION, AWG_PORT, AWG_SUBNET, AWG_CLIENT_NAME, REPO_RAW.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --prepare) MODE="prepare"; shift ;;
+    --full) MODE="full"; shift ;;
+    --resume-install) MODE="resume-install"; shift ;;
+    --mask-domain) MASK_DOMAIN="${2:?--mask-domain requires value}"; shift 2 ;;
+    --domain) MASK_DOMAIN="${2:?--domain requires value}"; shift 2 ;;
+    --port) PORT="${2:?--port requires value}"; shift 2 ;;
+    --version) PIN_VERSION="${2:?--version requires value}"; shift 2 ;;
+    --latest) USE_LATEST=1; shift ;;
+    --skip-checksum) SKIP_CHECKSUM=1; shift ;;
+    --install-awg) INSTALL_AWG=1; shift ;;
+    --awg-port) AWG_PORT="${2:?--awg-port requires value}"; shift 2 ;;
+    --awg-subnet) AWG_SUBNET="${2:?--awg-subnet requires value}"; shift 2 ;;
+    --awg-client) AWG_CLIENT_NAME="${2:?--awg-client requires value}"; shift 2 ;;
+    --random-mask-domain) RANDOM_MASK_DOMAIN=1; shift ;;
+    --enable-firewall) ENABLE_FIREWALL=1; shift ;;
+    --auto-updates) AUTO_UPDATES=1; shift ;;
+    --auto-reboot) AUTO_REBOOT=1; shift ;;
+    --remove-existing) REMOVE_EXISTING=1; shift ;;
+    -y|--yes) ASSUME_YES=1; shift ;;
+    --update) MODE="update"; shift ;;
+    --uninstall) MODE="uninstall"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "Unknown option: $1" ;;
+  esac
+done
+
+require_root() { [[ "$(id -u)" -eq 0 ]] || die "Run as root: sudo $0"; }
+require_systemd() { command -v systemctl >/dev/null 2>&1 || die "systemd is required"; }
 
 confirm() {
-  # confirm "question" -> returns 0 on yes
-  local q="$1"
-  if [ "$ASSUME_YES" = "true" ]; then return 0; fi
-  local a
-  read -r -p "$q [y/N]: " a </dev/tty || a=""
-  [[ "$a" =~ ^[Yy]$ ]]
-}
-
-ask() {
-  # ask "prompt" "default" -> echoes answer
-  local prompt="$1" def="${2:-}" a
-  if [ "$ASSUME_YES" = "true" ]; then echo "$def"; return; fi
-  if [ -n "$def" ]; then
-    read -r -p "$prompt [$def]: " a </dev/tty || a=""
-    echo "${a:-$def}"
-  else
-    read -r -p "$prompt: " a </dev/tty || a=""
-    echo "$a"
-  fi
-}
-
-# ----------------------------------------------------------------------------
-# Pre-flight checks
-# ----------------------------------------------------------------------------
-require_root() {
-  [ "$(id -u)" -eq 0 ] || die "Запустите установщик от root (sudo su / sudo bash ...)."
+  local prompt="$1"
+  if [[ "$ASSUME_YES" -eq 1 ]]; then return 0; fi
+  read -r -p "${prompt} [y/N]: " answer
+  [[ "$answer" =~ ^[Yy]$ ]]
 }
 
 detect_os() {
-  [ -r /etc/os-release ] || die "Не найден /etc/os-release — неподдерживаемая ОС."
+  [[ -f /etc/os-release ]] || die "/etc/os-release not found"
   # shellcheck disable=SC1091
   . /etc/os-release
-  local id="${ID:-}" ver="${VERSION_ID:-}"
-  case "$id:$ver" in
-    ubuntu:22.04|ubuntu:24.04|debian:12)
-      ok "ОС поддерживается: ${PRETTY_NAME:-$id $ver}" ;;
-    ubuntu:*|debian:*)
-      warn "ОС ${PRETTY_NAME:-$id $ver} официально не тестировалась этим установщиком."
-      confirm "Продолжить на свой риск?" || die "Остановлено пользователем." ;;
-    *)
-      die "Неподдерживаемая ОС: ${PRETTY_NAME:-$id $ver}. Нужны Ubuntu 22.04/24.04 или Debian 12." ;;
+  OS_ID="${ID:-unknown}"; OS_PRETTY="${PRETTY_NAME:-$OS_ID}"
+  case "$OS_ID" in
+    ubuntu|debian) ok "OS: ${OS_PRETTY}" ;;
+    *) warn "OS '${OS_ID}' is not tested. Ubuntu/Debian expected." ;;
   esac
+  require_systemd
+}
+
+validate_port_value() {
+  local value="$1" name="$2"
+  [[ "$value" =~ ^[0-9]+$ ]] || die "${name} must be numeric"
+  (( value >= 1 && value <= 65535 )) || die "${name} must be 1..65535"
+}
+
+validate_ports() {
+  validate_port_value "$PORT" "MTG port"
+  validate_port_value "$AWG_PORT" "AWG port"
 }
 
 detect_arch() {
-  ARCH="$(uname -m)"
-  case "$ARCH" in
-    x86_64|aarch64) ok "Архитектура: $ARCH" ;;
-    *) die "Архитектура $ARCH не поддерживается релизами telemt (нужны x86_64 или aarch64)." ;;
+  local m; m="$(uname -m)"
+  case "$m" in
+    x86_64|amd64) echo "amd64" ;;
+    aarch64|arm64) echo "arm64" ;;
+    armv7l|armv7) echo "armv7" ;;
+    armv6l|armv6) echo "armv6" ;;
+    i686|i386) echo "386" ;;
+    *) die "Unsupported architecture: $m" ;;
   esac
-  if ldd --version 2>&1 | grep -iq musl; then LIBC="musl"; else LIBC="gnu"; fi
 }
 
-install_deps() {
-  info "Установка зависимостей (curl, jq, tar, openssl, ca-certificates)..."
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -qq
-  apt-get install -y -qq curl jq tar openssl ca-certificates iproute2 >/dev/null
-  ok "Зависимости установлены."
+apt_install_base_deps() {
+  local deps=(ca-certificates curl tar coreutils iproute2 gawk sed grep findutils python3 openssl ufw fail2ban unattended-upgrades apt-listchanges)
+  info "Installing base dependencies"
+  apt-get update -y
+  DEBIAN_FRONTEND=noninteractive apt-get install -y "${deps[@]}"
+  systemctl enable --now fail2ban >/dev/null 2>&1 || true
+  timedatectl set-ntp true >/dev/null 2>&1 || true
 }
 
-resolve_telemt_version() {
-  if [ -n "$TELEMT_VERSION" ]; then
-    info "Версия telemt задана вручную: ${TELEMT_VERSION}"
+ensure_deps() {
+  local need=()
+  for cmd in curl tar sha256sum ip awk sed grep find install; do
+    command -v "$cmd" >/dev/null 2>&1 || case "$cmd" in
+      sha256sum) need+=(coreutils) ;;
+      ip) need+=(iproute2) ;;
+      awk) need+=(gawk) ;;
+      *) need+=("$cmd") ;;
+    esac
+  done
+  if ! command -v python3 >/dev/null 2>&1; then need+=(python3); fi
+  if ((${#need[@]})); then
+    info "Installing dependencies: ${need[*]}"
+    apt-get update -y
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "${need[@]}"
+  fi
+}
+
+setup_unattended_upgrades() {
+  info "Enabling unattended system security updates"
+  DEBIAN_FRONTEND=noninteractive apt-get install -y unattended-upgrades apt-listchanges
+  cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
+EOF
+  cat > /etc/apt/apt.conf.d/52mtg-auto-upgrades <<'EOF'
+Unattended-Upgrade::Automatic-Reboot "false";
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+Unattended-Upgrade::Remove-New-Unused-Dependencies "true";
+Unattended-Upgrade::Remove-Unused-Dependencies "false";
+EOF
+  systemctl enable --now apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
+  ok "Unattended upgrades enabled; automatic reboot is disabled"
+}
+
+setup_mtg_auto_update_timer() {
+  [[ "$AUTO_UPDATES" -eq 1 ]] || return 0
+  if [[ ! -x "$CTL_PATH" ]]; then
+    warn "mtgctl is not installed yet; mtg auto-update timer will be installed after mtgctl"
+    return 0
+  fi
+  info "Installing mtg auto-update systemd timer"
+  cat > "$MTG_UPDATE_SERVICE" <<EOF
+[Unit]
+Description=Update mtg binary to latest GitHub release with checksum verification
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${CTL_PATH} update --latest
+EOF
+  cat > "$MTG_UPDATE_TIMER" <<'EOF'
+[Unit]
+Description=Daily mtg update check
+
+[Timer]
+OnCalendar=03:30
+RandomizedDelaySec=2h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now mtg-auto-update.timer >/dev/null
+  ok "mtg-auto-update.timer enabled"
+}
+
+full_upgrade_system() {
+  info "Updating package lists and upgrading the system"
+  apt-get update -y
+  DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y
+  apt_install_base_deps
+  if [[ "$AUTO_UPDATES" -eq 1 ]]; then setup_unattended_upgrades; fi
+}
+
+detect_existing_mtproto() {
+  local out=()
+  for svc in mtg mtproxy mtproto-proxy MTProxy mtproto_proxy; do
+    if systemctl list-unit-files 2>/dev/null | awk '{print $1}' | grep -qx "${svc}.service" || systemctl is-active --quiet "$svc" 2>/dev/null; then
+      out+=("systemd:${svc}.service")
+    fi
+  done
+  [[ -x /usr/local/bin/mtg ]] && out+=("file:/usr/local/bin/mtg")
+  [[ -f /etc/mtg.toml ]] && out+=("file:/etc/mtg.toml")
+  [[ -d /etc/mtproxy ]] && out+=("dir:/etc/mtproxy")
+  [[ -d /etc/mtg ]] && out+=("dir:/etc/mtg")
+  [[ -d /opt/MTProxy ]] && out+=("dir:/opt/MTProxy")
+  if command -v docker >/dev/null 2>&1; then
+    while IFS='|' read -r id image name; do
+      [[ -z "$id" ]] && continue
+      if [[ "$image" =~ (telegrammessenger/proxy|nineseconds/mtg) || "$name" =~ (mtproto|mtproxy|mtg-proxy) ]]; then
+        out+=("docker:${name}:${image}")
+      fi
+    done < <(docker ps -a --format '{{.ID}}|{{.Image}}|{{.Names}}' 2>/dev/null || true)
+  fi
+  printf '%s\n' "${out[@]}"
+}
+
+remove_existing_mtproto() {
+  info "Removing known existing MTProto/MTG installations"
+  for svc in mtg mtproxy mtproto-proxy MTProxy mtproto_proxy; do
+    systemctl disable --now "$svc" >/dev/null 2>&1 || true
+  done
+  rm -f /etc/systemd/system/mtg.service /etc/systemd/system/mtproxy.service /etc/systemd/system/mtproto-proxy.service
+  systemctl daemon-reload || true
+  if command -v docker >/dev/null 2>&1; then
+    while IFS='|' read -r id image name; do
+      [[ -z "$id" ]] && continue
+      if [[ "$image" =~ (telegrammessenger/proxy|nineseconds/mtg) || "$name" =~ (mtproto|mtproxy|mtg-proxy) ]]; then
+        warn "Removing Docker container ${name} (${image})"
+        docker rm -f "$id" >/dev/null 2>&1 || true
+      fi
+    done < <(docker ps -a --format '{{.ID}}|{{.Image}}|{{.Names}}' 2>/dev/null || true)
+  fi
+  rm -f "$BIN_PATH" "$CTL_PATH" "$CONFIG_PATH"
+  rm -rf /etc/mtproxy /etc/mtg
+  if id -u "$RUN_USER" >/dev/null 2>&1; then userdel "$RUN_USER" >/dev/null 2>&1 || true; fi
+  ok "Known MTProto/MTG files and services removed"
+}
+
+handle_existing_mtproto() {
+  local findings
+  findings="$(detect_existing_mtproto || true)"
+  [[ -z "$findings" ]] && { ok "No existing MTProto/MTG install detected"; return 0; }
+  warn "Existing MTProto/MTG installation detected:"
+  printf '%s\n' "$findings" | sed 's/^/  - /' >&2
+  if [[ "$REMOVE_EXISTING" -eq 1 ]]; then
+    remove_existing_mtproto
+    return 0
+  fi
+  if confirm "Remove detected MTProto/MTG installation before continuing?"; then
+    remove_existing_mtproto
+  else
+    die "Refusing to install over existing MTProto/MTG. Re-run with --remove-existing or uninstall manually."
+  fi
+}
+
+save_self_for_resume() {
+  mkdir -p "$STATE_DIR"
+  if [[ -f "${BASH_SOURCE[0]}" ]]; then
+    cp "${BASH_SOURCE[0]}" "$SELF_PATH"
+  else
+    info "Current script is stdin; downloading install.sh from REPO_RAW for resume"
+    curl -fsSL --retry 3 -o "$SELF_PATH" "${REPO_RAW}/install.sh" || die "Cannot save installer for resume. Run from a local file or set REPO_RAW."
+  fi
+  chmod 0755 "$SELF_PATH"
+}
+
+write_resume_service() {
+  save_self_for_resume
+  local args=(--resume-install)
+  local skip_next=0
+  for ((i=0; i<${#ORIGINAL_ARGS[@]}; i++)); do
+    if [[ "$skip_next" -eq 1 ]]; then skip_next=0; continue; fi
+    local a="${ORIGINAL_ARGS[$i]}"
+    case "$a" in
+      --prepare|--full|--auto-reboot|--resume-install) continue ;;
+      --domain|--mask-domain|--port|--version|--awg-port|--awg-subnet|--awg-client)
+        args+=("$a" "${ORIGINAL_ARGS[$((i+1))]:-}"); skip_next=1 ;;
+      *) args+=("$a") ;;
+    esac
+  done
+  {
+    printf '#!/usr/bin/env bash\nset -Eeuo pipefail\n'
+    printf '/bin/bash %q' "$SELF_PATH"
+    for a in "${args[@]}"; do printf ' %q' "$a"; done
+    printf '\n'
+    printf 'systemctl disable --now mtg-installer-resume.service >/dev/null 2>&1 || true\n'
+    printf 'rm -f %q %q\n' "$RESUME_SERVICE" "$RESUME_SCRIPT"
+    printf 'systemctl daemon-reload || true\n'
+  } > "$RESUME_SCRIPT"
+  chmod 0755 "$RESUME_SCRIPT"
+
+  cat > "$RESUME_SERVICE" <<EOF
+[Unit]
+Description=Resume MTG installer after reboot
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash ${RESUME_SCRIPT}
+StandardOutput=append:/var/log/mtg-installer-resume.log
+StandardError=append:/var/log/mtg-installer-resume.log
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable mtg-installer-resume.service >/dev/null
+  ok "Resume service installed. Log after reboot: /var/log/mtg-installer-resume.log"
+}
+
+request_or_do_reboot() {
+  touch "$PREPARED_MARKER"
+  if [[ "$AUTO_REBOOT" -eq 1 ]]; then
+    write_resume_service
+    warn "Rebooting now. Installation will resume automatically after boot."
+    systemctl reboot
+    exit 0
+  fi
+  cat <<EOF
+
+${c_yel}Preparation is complete.${c_reset}
+Reboot the server, then run the installer again without --prepare:
+  sudo reboot
+  sudo ./install.sh --mask-domain ${MASK_DOMAIN:-ya.ru} --port ${PORT} --install-awg --enable-firewall --auto-updates --yes
+
+EOF
+  exit 0
+}
+
+resolve_version() {
+  if [[ "$USE_LATEST" -eq 0 ]]; then
+    echo "$PIN_VERSION"
     return
   fi
-  info "Определяю последнюю версию telemt из GitHub API..."
-  local ver
-  ver="$(curl -fsS -m 10 "https://api.github.com/repos/${TELEMT_REPO}/releases/latest" 2>/dev/null \
-        | jq -r '.tag_name // empty' 2>/dev/null || true)"
-  if [ -n "$ver" ] && [ "$ver" != "null" ]; then
-    TELEMT_VERSION="$ver"
-    ok "Последняя версия telemt: ${TELEMT_VERSION}"
-  else
-    TELEMT_VERSION="$TELEMT_FALLBACK_VERSION"
-    warn "GitHub API недоступен — использую fallback: ${TELEMT_VERSION}"
-  fi
+  local tag
+  tag="$(curl -fsSL "https://api.github.com/repos/${MTG_REPO}/releases/latest" 2>/dev/null \
+        | grep -oE '"tag_name":[[:space:]]*"[^"]+"' \
+        | head -1 \
+        | sed -E 's/.*"([^"]+)"$/\1/')" || true
+  [[ -n "$tag" ]] || die "Cannot resolve latest version. Use --version v2.2.8"
+  echo "$tag"
 }
 
-# ----------------------------------------------------------------------------
-# Network helpers
-# ----------------------------------------------------------------------------
-detect_public_ip() {
-  local ip=""
-  ip="$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.*src \([0-9.]*\).*/\1/p' | head -1 || true)"
-  if [ -z "$ip" ]; then
-    ip="$(curl -fsS -m 8 https://api.ipify.org 2>/dev/null || true)"
-  fi
-  echo "$ip"
-}
+download_and_install_binary() {
+  local tag="$1" arch="$2"
+  local ver="${tag#v}"
+  local asset="mtg-${ver}-linux-${arch}.tar.gz"
+  local sums="mtg-${ver}-checksums.txt"
+  local base="https://github.com/${MTG_REPO}/releases/download/${tag}"
+  local tmp; tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
 
-resolve_a() {
-  # resolve_a domain -> first A record (uses system resolver)
-  getent ahostsv4 "$1" 2>/dev/null | awk '{print $1; exit}'
-}
+  info "Downloading ${asset} (${tag})"
+  curl -fSL --retry 3 --retry-delay 2 -o "${tmp}/${asset}" "${base}/${asset}" \
+    || die "Cannot download ${asset}. Check version/architecture/network."
 
-# ----------------------------------------------------------------------------
-# Interactive configuration
-# ----------------------------------------------------------------------------
-gather_config() {
-  local pub_ip
-  pub_ip="$(detect_public_ip)"
-  [ -n "$pub_ip" ] && info "Определён внешний IP сервера: $pub_ip" || warn "Не удалось автоматически определить внешний IP."
-  SERVER_IP="$pub_ip"
-
-  # --- Deployment mode: always systemd (docker only via explicit --docker flag) ---
-  ok "Режим развёртывания: $DEPLOY"
-
-  # --- Connection host (link address) ---
-  echo
-  info "Адрес подключения — это server в ссылке (IP или ваш домен, указывающий A-записью на сервер)."
-  info "Это НЕ маскировочный SNI: домен здесь нужен только для адресации/красивой ссылки."
-  if [ -z "$CONN_HOST" ]; then
-    CONN_HOST="$(ask "Адрес подключения (IP или домен)" "${SERVER_IP:-}")"
-  fi
-  [ -n "$CONN_HOST" ] || die "Не указан адрес подключения."
-
-  # If it's a domain, validate the A record
-  if [[ ! "$CONN_HOST" =~ ^[0-9.]+$ ]]; then
-    local a
-    a="$(resolve_a "$CONN_HOST")"
-    if [ -z "$a" ]; then
-      warn "Домен $CONN_HOST не резолвится в A-запись. Ссылка может не работать."
-    elif [ -n "$SERVER_IP" ] && [ "$a" != "$SERVER_IP" ]; then
-      warn "A-запись $CONN_HOST = $a, а IP сервера = $SERVER_IP. Они не совпадают."
-      confirm "Всё равно продолжить?" || die "Остановлено пользователем."
+  info "Downloading checksums and verifying sha256"
+  if curl -fSL --retry 3 -o "${tmp}/${sums}" "${base}/${sums}" 2>/dev/null; then
+    local expected actual
+    expected="$(awk -v a="$asset" '$2 == a {print $1; exit}' "${tmp}/${sums}")"
+    if [[ -z "$expected" ]]; then
+      if [[ "$SKIP_CHECKSUM" -eq 1 ]]; then
+        warn "No checksum entry for ${asset}; continuing because --skip-checksum was set."
+      else
+        die "Checksum file does not contain ${asset}. Refusing to install. Use --skip-checksum only if you accept the risk."
+      fi
     else
-      ok "A-запись $CONN_HOST совпадает с IP сервера."
+      actual="$(sha256sum "${tmp}/${asset}" | awk '{print $1}')"
+      [[ "$expected" == "$actual" ]] || die "SHA256 mismatch for ${asset}. Refusing to install."
+      ok "sha256 verified"
     fi
-    warn "Рекомендация: настройте PTR/rDNS вашего IP на домен маскировки — это повышает «легитимность» хоста."
-  fi
-
-  # --- Masquerade domain (SNI / tls_domain) ---
-  echo
-  info "Маскировочный домен (SNI/tls_domain) — реальный, доступный с сервера HTTPS-сайт,"
-  info "под который маскируется трафик. Неаутентифицированные соединения прозрачно уходят на него."
-  MASK_DOMAIN="$(ask "Маскировочный домен (SNI)" "$MASK_DOMAIN")"
-  [ -n "$MASK_DOMAIN" ] || die "Не указан маскировочный домен."
-  if curl -fsS -o /dev/null -m 8 "https://${MASK_DOMAIN}" 2>/dev/null; then
-    ok "Маскировочный домен $MASK_DOMAIN доступен по HTTPS с сервера."
   else
-    warn "Не удалось открыть https://${MASK_DOMAIN} с сервера. Выберите доступный и не заблокированный сайт."
-    confirm "Продолжить с этим доменом?" || die "Остановлено пользователем."
+    if [[ "$SKIP_CHECKSUM" -eq 1 ]]; then
+      warn "Checksum file unavailable; continuing because --skip-checksum was set."
+    else
+      die "Checksum file unavailable. Refusing to install. Use --skip-checksum only if you accept the risk."
+    fi
   fi
 
-  # --- Port ---
-  echo
-  info "Порт по умолчанию 443/tcp (максимально похож на обычный HTTPS)."
-  info "Нестандартный порт (например 8443) допустим, но снижает «похожесть на HTTPS»."
-  PORT="$(ask "Порт" "$PORT")"
-  [[ "$PORT" =~ ^[0-9]+$ ]] && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || die "Некорректный порт: $PORT"
-  check_port_free
+  info "Installing binary into ${BIN_PATH}"
+  tar -xzf "${tmp}/${asset}" -C "$tmp"
+  local found; found="$(find "$tmp" -type f -name mtg -perm /111 | head -1)"
+  [[ -n "$found" ]] || die "mtg binary not found in archive"
+  install -m 0755 "$found" "$BIN_PATH"
+  ok "Installed: $("$BIN_PATH" --version 2>/dev/null | head -1 || echo "$tag")"
+}
 
-  # --- Secret mode ---
-  if [ "$INSECURE_DIAGNOSTIC_ONLY" = "true" ]; then
-    warn "INSECURE_DIAGNOSTIC_ONLY=true — будет включён classic (bare secret). Только для диагностики!"
+random_mask_domain() {
+  local n idx
+  n="${#MASK_DOMAIN_CANDIDATES[@]}"
+  idx="$(rand_int 0 $((n - 1)))"
+  echo "${MASK_DOMAIN_CANDIDATES[$idx]}"
+}
+
+show_mask_domain_candidates() {
+  local i=1 d
+  for d in "${MASK_DOMAIN_CANDIDATES[@]}"; do
+    printf '  %2d) %s\n' "$i" "$d"
+    i=$((i + 1))
+  done
+}
+
+prompt_mask_domain() {
+  if [[ "$RANDOM_MASK_DOMAIN" -eq 1 ]]; then
+    MASK_DOMAIN="$(random_mask_domain)"
+    ok "Random mask domain selected: ${MASK_DOMAIN}"
+    return
+  fi
+  [[ -n "$MASK_DOMAIN" ]] && return
+
+  if [[ "$ASSUME_YES" -eq 1 ]]; then
+    MASK_DOMAIN="$(random_mask_domain)"
+    ok "No --mask-domain provided in --yes mode; random mask domain selected: ${MASK_DOMAIN}"
+    return
+  fi
+
+  cat <<EOF
+
+${c_bld}FakeTLS mask domain / SNI${c_reset}
+Choose a real HTTPS domain that makes sense for your VPS/network.
+Bad example: google.com on a non-Google VPS.
+Better: provider-related domain, CDN/provider domain, or your own HTTPS domain.
+
+Options:
+  1) Enter my own domain
+  2) Pick random from built-in list
+  3) Show built-in list and choose by number
+EOF
+  local choice
+  read -rp "Choice [2]: " choice
+  choice="${choice:-2}"
+  case "$choice" in
+    1)
+      read -rp "Mask domain: " MASK_DOMAIN
+      ;;
+    3)
+      show_mask_domain_candidates
+      local idx
+      read -rp "Number [1]: " idx
+      idx="${idx:-1}"
+      [[ "$idx" =~ ^[0-9]+$ ]] && (( idx >= 1 && idx <= ${#MASK_DOMAIN_CANDIDATES[@]} )) || die "Invalid domain list number"
+      MASK_DOMAIN="${MASK_DOMAIN_CANDIDATES[$((idx - 1))]}"
+      ;;
+    2|*)
+      MASK_DOMAIN="$(random_mask_domain)"
+      ok "Random mask domain selected: ${MASK_DOMAIN}"
+      ;;
+  esac
+}
+
+validate_mask_domain() {
+  [[ "$MASK_DOMAIN" =~ ^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] || die "Invalid mask domain: ${MASK_DOMAIN}"
+}
+
+detect_prefer_ip() {
+  if ip -6 route show default 2>/dev/null | grep -q .; then
+    echo "prefer-ipv6"
+  else
+    echo "prefer-ipv4"
+  fi
+}
+
+ensure_runtime_user() {
+  if ! getent group "$RUN_GROUP" >/dev/null; then
+    groupadd --system "$RUN_GROUP"
+  fi
+  if ! id -u "$RUN_USER" >/dev/null 2>&1; then
+    useradd --system --no-create-home --shell /usr/sbin/nologin --gid "$RUN_GROUP" "$RUN_USER"
   fi
 }
 
 check_port_free() {
-  local lines
-  lines="$(ss -lntpH "sport = :${PORT}" 2>/dev/null || true)"
-  if [ -z "$lines" ]; then
-    ok "Порт ${PORT}/tcp свободен."
-    return
+  if command -v ss >/dev/null 2>&1 && ss -ltnH "( sport = :${PORT} )" 2>/dev/null | grep -q .; then
+    die "TCP port ${PORT} is already in use. Stop conflicting service or choose --port 8443."
   fi
-
-  warn "Порт ${PORT} уже занят:"
-  echo "$lines" | sed 's/^/    /'
-
-  if [ "$ASSUME_YES" = "true" ]; then
-    die "Порт занят (неинтерактивный режим). Освободите порт или задайте PORT=другой."
-  fi
-
-  local choice
-  choice="$(ask "Действие: [d] удалить занявший сервис / [p] другой порт / [q] выход" "q")"
-  case "$choice" in
-    d|D) delete_port_occupant; check_port_free ;;
-    p|P) PORT="$(ask "Новый порт" "8443")"; check_port_free ;;
-    *)   die "Выход. Освободите порт вручную и перезапустите установщик." ;;
-  esac
 }
 
-delete_port_occupant() {
-  local pids
-  pids="$(ss -lntpH "sport = :${PORT}" 2>/dev/null | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u)"
-  if [ -z "$pids" ]; then
-    warn "Не удалось определить PID процесса на порту ${PORT} (запущено не от root?)."
-    return
-  fi
-
-  local pid
-  for pid in $pids; do
-    local pname unit fragment binary pkg
-    pname="$(ps -o comm= -p "$pid" 2>/dev/null || echo "pid $pid")"
-
-    # Determine systemd unit via cgroup
-    unit=""
-    [ -r "/proc/$pid/cgroup" ] && unit="$(grep -oE '[a-zA-Z0-9@._-]+\.service' "/proc/$pid/cgroup" | head -1 || true)"
-
-    if [ -z "$unit" ]; then
-      warn "Процесс '${pname}' (pid ${pid}) не управляется systemd."
-      warn "Установщик не может удалить его автоматически — завершите его вручную или выберите другой порт."
-      continue
-    fi
-
-    info "Процесс '${pname}' (pid ${pid}) → systemd-юнит: ${unit}"
-
-    fragment="$(systemctl show "$unit" --property=FragmentPath --value 2>/dev/null || true)"
-    binary="$(systemctl show "$unit" --property=ExecStart --value 2>/dev/null \
-              | sed -n 's/.*{ path=\([^ ;]*\).*/\1/p' | head -1 || true)"
-
-    info "  Unit-файл: ${fragment:-не определён}"
-    info "  Бинарник:  ${binary:-не определён}"
-
-    # Check if installed via dpkg
-    pkg=""
-    if [ -n "$binary" ] && command -v dpkg >/dev/null 2>&1; then
-      pkg="$(dpkg -S "$binary" 2>/dev/null | cut -d: -f1 | head -1 || true)"
-    fi
-
-    if [ -n "$pkg" ]; then
-      # Package-managed service — purge via apt to keep dpkg consistent
-      warn "Сервис ${unit} установлен из пакета '${pkg}' (dpkg -S ${binary})."
-      warn "Рекомендуется apt-get purge, чтобы не сломать базу dpkg."
-      if confirm "Выполнить: apt-get purge --autoremove ${pkg}?"; then
-        apt-get purge --autoremove -y "$pkg"
-        ok "Пакет '${pkg}' удалён."
-      fi
-    else
-      # Standalone installation (e.g. xray install-release.sh)
-      warn "Сервис ${unit} — standalone-установка (вне dpkg)."
-
-      if confirm "Остановить ${unit}?"; then
-        systemctl stop "$unit" 2>/dev/null && ok "Остановлен ${unit}." || warn "Не удалось остановить ${unit}."
-      fi
-
-      if confirm "Отключить автозапуск ${unit}?"; then
-        systemctl disable "$unit" >/dev/null 2>&1 && ok "Автозапуск ${unit} отключён." || warn "Не удалось отключить автозапуск ${unit}."
-      fi
-
-      if [ -n "$fragment" ] && [ -f "$fragment" ] && confirm "Удалить unit-файл ${fragment}?"; then
-        rm -f "$fragment"
-        ok "Удалён unit-файл: ${fragment}"
-      fi
-
-      if [ -n "$fragment" ]; then
-        local dropin
-        dropin="$(dirname "$fragment")/${unit}.d"
-        if [ -d "$dropin" ] && confirm "Удалить drop-in каталог ${dropin}?"; then
-          rm -rf "$dropin"
-          ok "Удалён drop-in каталог: ${dropin}"
-        fi
-      fi
-
-      systemctl daemon-reload
-      ok "daemon-reload выполнен."
-
-      if [ -n "$binary" ] && [ -f "$binary" ] && confirm "Удалить бинарник ${binary}?"; then
-        rm -f "$binary"
-        ok "Удалён бинарник: ${binary}"
-      fi
-
-      # xray-specific: offer to remove config/data directories
-      if echo "${binary}${unit}" | grep -qi xray; then
-        local xray_dirs=("/usr/local/etc/xray" "/etc/xray" "/usr/local/share/xray" "/var/log/xray")
-        local found_dirs=()
-        for d in "${xray_dirs[@]}"; do [ -d "$d" ] && found_dirs+=("$d"); done
-        if [ "${#found_dirs[@]}" -gt 0 ]; then
-          info "Обнаружены данные xray: ${found_dirs[*]}"
-          if confirm "Удалить конфиги и данные xray (${found_dirs[*]})?"; then
-            for d in "${found_dirs[@]}"; do rm -rf "$d" && ok "Удалено: $d"; done
-          fi
-        fi
-      fi
-    fi
-  done
-
-  sleep 1
-}
-
-# ----------------------------------------------------------------------------
-# Download + integrity verification
-# ----------------------------------------------------------------------------
-telemt_download_verify() {
-  # args: <version> <dest_binary_path>
-  local ver="$1" dest="$2"
-  local asset="telemt-${ARCH}-linux-${LIBC}.tar.gz"
-  local base="https://github.com/${TELEMT_REPO}/releases/download/${ver}"
-  local url="${base}/${asset}"
-  local tmp; tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"' RETURN
-
-  info "Скачивание telemt ${ver} (${asset})..."
-  curl -fSL --retry 3 -o "${tmp}/${asset}" "$url" || die "Не удалось скачать $url"
-
-  local computed
-  computed="$(sha256sum "${tmp}/${asset}" | awk '{print $1}')"
-  info "SHA256 скачанного файла: ${computed}"
-
-  local verified="false" expected=""
-  if [ -n "$TELEMT_SHA256" ]; then
-    expected="$TELEMT_SHA256"
-    info "Сверка с заданным TELEMT_SHA256..."
-  elif curl -fsS -m 10 -o "${tmp}/asset.sha256" "${url}.sha256" 2>/dev/null; then
-    expected="$(grep -oE '[0-9a-fA-F]{64}' "${tmp}/asset.sha256" | head -1 || true)"
-    [ -n "$expected" ] && info "Найден ${asset}.sha256 в релизе."
-  elif curl -fsS -m 10 -o "${tmp}/SHA256SUMS" "${base}/SHA256SUMS" 2>/dev/null; then
-    expected="$(grep -E "(^| )${asset}\$|  ?${asset}\$" "${tmp}/SHA256SUMS" | grep -oE '[0-9a-fA-F]{64}' | head -1 || true)"
-    [ -n "$expected" ] && info "Найден SHA256SUMS в релизе."
-  fi
-
-  if [ -n "$expected" ]; then
-    if [ "${computed,,}" = "${expected,,}" ]; then
-      verified="true"; ok "Контрольная сумма совпала."
-    else
-      die "Контрольная сумма НЕ совпала! ожидалось ${expected}, получено ${computed}. Установка прервана."
-    fi
-  fi
-
-  if [ "$verified" != "true" ]; then
-    warn "Upstream не публикует контрольные суммы для этого релиза."
-    info "SHA256 скачанного файла: ${computed}"
-    if [ "$ALLOW_UNVERIFIED" = "true" ]; then
-      warn "ALLOW_UNVERIFIED=true — продолжаю без проверки целостности."
-    elif [ "$ASSUME_YES" != "true" ]; then
-      warn "Для повторной установки той же версии используйте:"
-      warn "  TELEMT_SHA256=${computed} bash install.sh"
-      confirm "Принять этот хеш как доверенный и продолжить установку?" \
-        || die "Установка отменена пользователем."
-    else
-      err  "Неинтерактивный режим — укажите хеш явно:"
-      err  "  TELEMT_SHA256=${computed} bash install.sh"
-      err  "или: ALLOW_UNVERIFIED=true bash install.sh"
-      die  "Установка прервана: нет верифицированной контрольной суммы."
-    fi
-  fi
-
-  tar -xzf "${tmp}/${asset}" -C "$tmp"
-  local extracted
-  extracted="$(find "$tmp" -maxdepth 2 -type f -name telemt | head -1 || true)"
-  [ -n "$extracted" ] || die "В архиве не найден бинарник telemt."
-  install -m 0755 "$extracted" "$dest"
-  ok "Бинарник установлен: $dest"
-}
-
-# ----------------------------------------------------------------------------
-# Users / directories / secret
-# ----------------------------------------------------------------------------
-create_user_dirs() {
-  if ! id "$PROXY_USER" >/dev/null 2>&1; then
-    useradd -r -d "$PROXY_HOME" -m -s /usr/sbin/nologin -U "$PROXY_USER"
-    ok "Создан системный пользователь $PROXY_USER."
-  fi
-  install -d -m 0750 -o "$PROXY_USER" -g "$PROXY_USER" "$CONF_DIR"
-  install -d -m 0700 -o "$PROXY_USER" -g "$PROXY_USER" "$BACKUP_DIR"
-}
-
-gen_secret() { openssl rand -hex 16; }
-
-# ----------------------------------------------------------------------------
-# Config / unit / env files
-# ----------------------------------------------------------------------------
 write_config() {
-  local secret="$1"
-  local classic="false" secure="true" tls="true"
-  [ "$INSECURE_DIAGNOSTIC_ONLY" = "true" ] && classic="true"
+  local secret prefer
+  info "Generating FakeTLS secret for mask domain ${MASK_DOMAIN}"
+  secret="$("$BIN_PATH" generate-secret --hex "$MASK_DOMAIN")" || die "mtg failed to generate secret"
+  [[ "$secret" =~ ^ee[0-9a-f]+$ ]] || die "Generated secret does not look like FakeTLS hex secret"
+  prefer="$(detect_prefer_ip)"
 
-  umask 077
+  info "Writing ${CONFIG_PATH}"
+  umask 027
   cat > "$CONFIG_PATH" <<EOF
-# Generated by mtproto-proxy installer. Backend: telemt.
-# Fake TLS (ee) primary, Secure (dd) fallback. classic only for diagnostics.
-
-[general]
-use_middle_proxy = false
-log_level = "normal"
-
-[general.modes]
-classic = ${classic}
-secure = ${secure}
-tls = ${tls}
-
-[general.links]
-show = "*"
-public_host = "${CONN_HOST}"
-public_port = ${PORT}
-
-[server]
-port = ${PORT}
-
-# Local-only management API used to retrieve working links. Not exposed externally.
-[server.api]
-enabled = true
-listen = "${API_ADDR}"
-whitelist = ["127.0.0.1/32"]
-read_only = true
-
-# Anti-censorship / masking: unauthenticated traffic is transparently
-# forwarded to the real site (mask_host defaults to tls_domain),
-# so a scanner sees a genuine HTTPS host instead of a dead port.
-[censorship]
-tls_domain = "${MASK_DOMAIN}"
-
-[access.users]
-${PROXY_USERNAME} = "${secret}"
+# mtg config generated by install.sh on $(date -u +%FT%TZ)
+secret = "${secret}"
+bind-to = "0.0.0.0:${PORT}"
+prefer-ip = "${prefer}"
 EOF
-  chown "$PROXY_USER:$PROXY_USER" "$CONFIG_PATH"
-  chmod 600 "$CONFIG_PATH"
-  ok "Конфиг записан: $CONFIG_PATH (chmod 600)"
+  chown root:"$RUN_GROUP" "$CONFIG_PATH"
+  chmod 0640 "$CONFIG_PATH"
+  ok "Config written: ${CONFIG_PATH} (root:${RUN_GROUP} 0640)"
 }
 
-write_unit() {
-  cat > "$UNIT_PATH" <<UNIT_EOF
+install_service() {
+  info "Installing systemd service"
+  cat > "$SERVICE_PATH" <<EOF
 [Unit]
-Description=MTProto Proxy (telemt)
-Documentation=https://github.com/telemt/telemt
+Description=mtg - MTProto proxy server
+Documentation=https://github.com/9seconds/mtg
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=${PROXY_USER}
-Group=${PROXY_USER}
-WorkingDirectory=${PROXY_HOME}
-ExecStart=${BIN_PATH} ${CONFIG_PATH}
-Restart=on-failure
+User=${RUN_USER}
+Group=${RUN_GROUP}
+ExecStart=${BIN_PATH} run ${CONFIG_PATH}
+Restart=always
 RestartSec=3
 LimitNOFILE=65536
-
-# Bind to privileged port without running as root
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-
-# Hardening
 NoNewPrivileges=true
 PrivateTmp=true
-ProtectSystem=strict
 ProtectHome=true
-ProtectControlGroups=true
-ProtectKernelModules=true
-ProtectKernelTunables=true
-RestrictNamespaces=true
-RestrictSUIDSGID=true
-ReadWritePaths=${CONF_DIR} ${PROXY_HOME}
+ProtectSystem=strict
+ReadOnlyPaths=${CONFIG_PATH}
 
 [Install]
 WantedBy=multi-user.target
-UNIT_EOF
-  ok "systemd-юнит записан: $UNIT_PATH"
-}
-
-write_env() {
-  umask 077
-  cat > "$ENV_PATH" <<EOF
-# State for mtproto-proxy-manager. Do not edit by hand unless you know what you do.
-DEPLOY="${DEPLOY}"
-SERVICE_NAME="${SERVICE_NAME}"
-UNIT_PATH="${UNIT_PATH}"
-CONF_DIR="${CONF_DIR}"
-CONFIG_PATH="${CONFIG_PATH}"
-LINKS_PATH="${LINKS_PATH}"
-BACKUP_DIR="${BACKUP_DIR}"
-BIN_PATH="${BIN_PATH}"
-MANAGER_PATH="${MANAGER_PATH}"
-PROXY_USER="${PROXY_USER}"
-PROXY_HOME="${PROXY_HOME}"
-PROXY_USERNAME="${PROXY_USERNAME}"
-API_ADDR="${API_ADDR}"
-PORT="${PORT}"
-CONN_HOST="${CONN_HOST}"
-MASK_DOMAIN="${MASK_DOMAIN}"
-TELEMT_REPO="${TELEMT_REPO}"
-TELEMT_VERSION="${TELEMT_VERSION}"
-ARCH="${ARCH}"
-LIBC="${LIBC}"
-FW_BACKEND="${FW_BACKEND:-none}"
-BBR_ENABLED="${BBR_ENABLED:-false}"
 EOF
-  chmod 600 "$ENV_PATH"
-}
-
-# ----------------------------------------------------------------------------
-# Firewall
-# ----------------------------------------------------------------------------
-setup_firewall() {
-  FW_BACKEND="none"
-  if command -v ufw >/dev/null 2>&1; then
-    # ufw установлен — использовать его всегда (активен или нет).
-    # iptables-persistent конфликтует с ufw и удаляет его; смешивать нельзя.
-    FW_BACKEND="ufw"
-    maybe_protect_ssh_ufw
-    if ! ufw status 2>/dev/null | grep -q "Status: active"; then
-      info "ufw установлен, но не активен — включаю."
-      ufw --force enable >/dev/null
-    fi
-    ufw allow "${PORT}/tcp" >/dev/null
-    ok "ufw: разрешён ${PORT}/tcp."
-  elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-    FW_BACKEND="firewalld"
-    info "Обнаружен firewalld — открываю ${PORT}/tcp."
-    firewall-cmd --permanent --add-port="${PORT}/tcp" >/dev/null
-    firewall-cmd --reload >/dev/null
-    ok "firewalld: разрешён ${PORT}/tcp."
-  elif command -v iptables >/dev/null 2>&1; then
-    FW_BACKEND="iptables"
-    info "Добавляю ACCEPT-правило iptables для ${PORT}/tcp..."
-    if ! iptables -C INPUT -p tcp --dport "${PORT}" -j ACCEPT 2>/dev/null; then
-      iptables -I INPUT -p tcp --dport "${PORT}" -j ACCEPT
-    fi
-    if command -v netfilter-persistent >/dev/null 2>&1; then
-      netfilter-persistent save >/dev/null 2>&1 \
-        && ok "iptables: правила сохранены (netfilter-persistent)." \
-        || warn "netfilter-persistent save завершился с ошибкой."
-    else
-      warn "netfilter-persistent не найден — правило iptables не переживёт перезагрузку."
-      warn "Установите вручную: apt-get install iptables-persistent && netfilter-persistent save"
-    fi
-  else
-    warn "Файрвол не обнаружен. Откройте ${PORT}/tcp вручную, если используете фильтрацию."
-  fi
-  export FW_BACKEND
-}
-
-maybe_protect_ssh_ufw() {
-  local do_ssh="$PROTECT_SSH"
-  if [ "$do_ssh" = "ask" ]; then
-    if confirm "Защитить SSH-порт в ufw (allow OpenSSH), чтобы не потерять доступ?"; then do_ssh="true"; else do_ssh="false"; fi
-  fi
-  if [ "$do_ssh" = "true" ]; then
-    ufw allow OpenSSH >/dev/null 2>&1 || ufw allow 22/tcp >/dev/null 2>&1 || true
-    ok "ufw: SSH разрешён."
-  fi
-}
-
-# ----------------------------------------------------------------------------
-# TCP BBR (performance only, NOT anti-DPI)
-# ----------------------------------------------------------------------------
-setup_bbr() {
-  local want="$ENABLE_BBR"
-  if [ "$want" = "ask" ]; then
-    if confirm "Включить TCP BBR? (улучшает стабильность/скорость; это НЕ метод анти-DPI)"; then want="true"; else want="false"; fi
-  fi
-  BBR_ENABLED="false"
-  [ "$want" = "true" ] || { info "BBR пропущен."; export BBR_ENABLED; return; }
-
-  modprobe tcp_bbr 2>/dev/null || true
-  if ! sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
-    warn "Ядро не поддерживает BBR — пропускаю."
-    export BBR_ENABLED; return
-  fi
-  cat > /etc/sysctl.d/99-mtproto-bbr.conf <<'EOF'
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-EOF
-  sysctl --system >/dev/null 2>&1 || true
-  if [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" = "bbr" ]; then
-    BBR_ENABLED="true"; ok "TCP BBR включён."
-  else
-    warn "Не удалось активировать BBR."
-  fi
-  export BBR_ENABLED
-}
-
-# ----------------------------------------------------------------------------
-# Service start + health checks
-# ----------------------------------------------------------------------------
-start_systemd() {
   systemctl daemon-reload
-  systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
+  systemctl enable "$SERVICE_NAME" >/dev/null
   systemctl restart "$SERVICE_NAME"
-}
-
-healthcheck() {
-  local ok_active="false" ok_port="false"
-  sleep 2
-  if systemctl is-active --quiet "$SERVICE_NAME"; then ok_active="true"; ok "Сервис активен."; else err "Сервис не активен."; fi
-  if ss -lntH "sport = :${PORT}" 2>/dev/null | grep -q .; then ok_port="true"; ok "Порт ${PORT} слушается."; else err "Порт ${PORT} не слушается."; fi
-  info "Последние строки журнала:"
-  journalctl -u "$SERVICE_NAME" --no-pager -n 15 2>/dev/null | sed 's/^/    /' || true
-  info "Проверка TLS-handshake на ${CONN_HOST}:${PORT} (ожидается ответ маскировочного сайта, не обрыв)..."
-  if curl -k -sS -m 8 -o /dev/null -w "    HTTP %{http_code}, TLS %{ssl_verify_result}\n" "https://${CONN_HOST}:${PORT}/" 2>/dev/null; then
-    ok "Соединение установилось (фронтинг отвечает)."
+  sleep 1
+  if systemctl is-active --quiet "$SERVICE_NAME"; then
+    ok "Service ${SERVICE_NAME} is active"
   else
-    warn "curl не получил ответ — проверьте firewall/маскировочный домен. Это не всегда означает поломку."
-  fi
-  [ "$ok_active" = "true" ] && [ "$ok_port" = "true" ]
-}
-
-fetch_links() {
-  local tries=15 out=""
-  while [ "$tries" -gt 0 ]; do
-    out="$(curl -fsS -m 5 "http://${API_ADDR}/v1/users" 2>/dev/null || true)"
-    if [ -n "$out" ] && echo "$out" | jq -e '.data' >/dev/null 2>&1; then break; fi
-    tries=$((tries-1)); sleep 1
-  done
-  if [ -z "$out" ]; then warn "Не удалось получить ссылки через Control API."; return 1; fi
-  {
-    echo "$out" | jq -r '
-      .data[] |
-      (.links.tls[]?     | "Link (Fake TLS / ee): \(.)"),
-      (.links.secure[]?  | "Link (Secure / dd):   \(.)"),
-      (.links.classic[]? | "Link (Classic):       \(.)")'
-  } | tee "$LINKS_PATH" >/dev/null
-  chmod 600 "$LINKS_PATH"; chown "$PROXY_USER:$PROXY_USER" "$LINKS_PATH" 2>/dev/null || true
-}
-
-print_summary() {
-  local secret="$1"
-  local masked="${secret:0:4}…${secret: -4}"
-  echo
-  echo "${C_BLD}========================================================${C_RST}"
-  echo "${C_BLD} MTProto Proxy установлен.${C_RST}"
-  echo "${C_BLD}========================================================${C_RST}"
-  echo " Server:   ${CONN_HOST}"
-  echo " Port:     ${PORT}"
-  echo " Mode:     Fake TLS (ee) primary / Secure (dd) fallback"
-  echo " SNI/mask: ${MASK_DOMAIN}"
-  echo " Secret:   ${masked}  (полностью — через: mtproto-proxy-manager show-links)"
-  echo " Status:   $(systemctl is-active "$SERVICE_NAME" 2>/dev/null || echo unknown)"
-  echo
-  if [ -s "$LINKS_PATH" ]; then
-    sed 's/^/ /' "$LINKS_PATH"
-  else
-    echo " Ссылки: выполните  mtproto-proxy-manager show-links"
-  fi
-  echo "${C_BLD}========================================================${C_RST}"
-  echo " Управление:  mtproto-proxy-manager <status|restart|logs|show-links|rotate-secret|update|uninstall>"
-  echo
-  warn "MTProto+FakeTLS СНИЖАЕТ обнаруживаемость DPI, но НЕ гарантирует обход. Это не замена VPN."
-  echo
-}
-
-# ----------------------------------------------------------------------------
-# Docker deployment (optional, isolation only — NOT a replacement for systemd)
-# ----------------------------------------------------------------------------
-deploy_docker() {
-  local secret="$1"
-  command -v docker >/dev/null 2>&1 || die "Docker не установлен. Установите Docker и docker compose, либо используйте режим systemd."
-  docker compose version >/dev/null 2>&1 || die "Не найден 'docker compose' (v2)."
-
-  write_config "$secret"   # reuse same config; telemt reads /etc/mtproto-proxy/telemt.toml
-  cat > "${CONF_DIR}/docker-compose.yml" <<EOF
-services:
-  telemt:
-    # Build from the official upstream source pinned to a tag (no third-party images).
-    build:
-      context: https://github.com/${TELEMT_REPO}.git#${TELEMT_VERSION}
-    container_name: mtproto-proxy
-    restart: unless-stopped
-    read_only: true
-    cap_drop: ["ALL"]
-    cap_add: ["NET_BIND_SERVICE"]
-    ulimits:
-      nofile: { soft: 65536, hard: 65536 }
-    network_mode: host
-    volumes:
-      - ${CONFIG_PATH}:/app/config/config.toml:ro
-EOF
-  chmod 600 "${CONF_DIR}/docker-compose.yml"
-  info "Сборка и запуск контейнера (может занять время — сборка из исходников Rust)..."
-  ( cd "$CONF_DIR" && docker compose up -d --build )
-  ok "Контейнер запущен."
-}
-
-# ----------------------------------------------------------------------------
-# Manager installation (embedded)
-# ----------------------------------------------------------------------------
-install_manager() {
-  cat > "$MANAGER_PATH" <<'MANAGER_EOF'
-#!/usr/bin/env bash
-# mtproto-proxy-manager — management tool for the telemt-based MTProto proxy.
-set -euo pipefail
-
-ENV_PATH="/etc/mtproto-proxy/installer.env"
-[ -r "$ENV_PATH" ] || { echo "Не найден $ENV_PATH. Прокси не установлен?" >&2; exit 1; }
-# shellcheck disable=SC1090
-. "$ENV_PATH"
-
-if [ -t 1 ]; then C_G=$'\033[32m'; C_Y=$'\033[33m'; C_R=$'\033[31m'; C_0=$'\033[0m'; else C_G=""; C_Y=""; C_R=""; C_0=""; fi
-ok()   { printf '%s[+]%s %s\n' "$C_G" "$C_0" "$*"; }
-warn() { printf '%s[!]%s %s\n' "$C_Y" "$C_0" "$*" >&2; }
-die()  { printf '%s[x]%s %s\n' "$C_R" "$C_0" "$*" >&2; exit 1; }
-need_root() { [ "$(id -u)" -eq 0 ] || die "Требуются права root."; }
-
-is_docker() { [ "${DEPLOY:-systemd}" = "docker" ]; }
-dc() { ( cd "$CONF_DIR" && docker compose "$@" ); }
-
-cmd_status() {
-  if is_docker; then dc ps; else systemctl status "$SERVICE_NAME" --no-pager || true; fi
-}
-cmd_start()   { need_root; if is_docker; then dc up -d; else systemctl start "$SERVICE_NAME"; fi; ok "started"; }
-cmd_stop()    { need_root; if is_docker; then dc down; else systemctl stop "$SERVICE_NAME"; fi; ok "stopped"; }
-cmd_restart() { need_root; if is_docker; then dc restart || dc up -d; else systemctl restart "$SERVICE_NAME"; fi; ok "restarted"; }
-cmd_logs() {
-  if is_docker; then dc logs -f --tail=100; else journalctl -u "$SERVICE_NAME" -f -n 100; fi
-}
-
-cmd_show_links() {
-  local out
-  out="$(curl -fsS -m 5 "http://${API_ADDR}/v1/users" 2>/dev/null || true)"
-  if [ -n "$out" ] && echo "$out" | jq -e '.data' >/dev/null 2>&1; then
-    echo "$out" | jq -r '
-      .data[] |
-      (.links.tls[]?     | "Fake TLS (ee): \(.)"),
-      (.links.secure[]?  | "Secure  (dd): \(.)"),
-      (.links.classic[]? | "Classic:      \(.)")'
-  elif [ -r "$LINKS_PATH" ]; then
-    warn "Control API недоступен — показываю сохранённые ссылки."
-    cat "$LINKS_PATH"
-  else
-    die "Ссылки недоступны: ни API, ни кэш."
+    warn "Service is not active. Check: journalctl -u ${SERVICE_NAME} -n 80 --no-pager"
   fi
 }
 
-cmd_rotate_secret() {
-  need_root
-  command -v openssl >/dev/null 2>&1 || die "openssl не найден."
-  local new ts backup
-  new="$(openssl rand -hex 16)"
-  ts="$(date +%Y%m%d-%H%M%S)"
-  backup="${BACKUP_DIR}/telemt.toml.${ts}"
-  install -d -m 0700 "$BACKUP_DIR"
-  cp -a "$CONFIG_PATH" "$backup"
-  chmod 600 "$backup"
-  ok "Бэкап конфига: $backup"
-  sed -i -E "s/^([[:space:]]*${PROXY_USERNAME}[[:space:]]*=[[:space:]]*\")[0-9a-fA-F]{32}(\".*)$/\1${new}\2/" "$CONFIG_PATH"
-  grep -qE "\"${new}\"" "$CONFIG_PATH" || die "Не удалось обновить secret в конфиге (откатитесь к $backup)."
-  cmd_restart
-  sleep 2
-  ok "Secret обновлён. Новые ссылки:"
-  cmd_show_links
-}
-
-verify_and_install_binary() {
-  # args: <version>  — downloads, verifies, installs into $BIN_PATH (systemd mode)
-  local ver="$1"
-  local asset="telemt-${ARCH}-linux-${LIBC}.tar.gz"
-  local base="https://github.com/${TELEMT_REPO}/releases/download/${ver}"
-  local url="${base}/${asset}"
-  local tmp; tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' RETURN
-  curl -fSL --retry 3 -o "${tmp}/${asset}" "$url" || die "Скачивание не удалось: $url"
-  local computed expected=""
-  computed="$(sha256sum "${tmp}/${asset}" | awk '{print $1}')"
-  if [ -n "${TELEMT_SHA256:-}" ]; then expected="$TELEMT_SHA256"
-  elif curl -fsS -m 10 -o "${tmp}/s" "${url}.sha256" 2>/dev/null; then expected="$(grep -oE '[0-9a-fA-F]{64}' "${tmp}/s" | head -1 || true)"
-  elif curl -fsS -m 10 -o "${tmp}/S" "${base}/SHA256SUMS" 2>/dev/null; then expected="$(grep "$asset" "${tmp}/S" | grep -oE '[0-9a-fA-F]{64}' | head -1 || true)"
-  fi
-  if [ -n "$expected" ]; then
-    [ "${computed,,}" = "${expected,,}" ] || die "Контрольная сумма не совпала ($computed != $expected)."
-    ok "Контрольная сумма подтверждена."
-  elif [ "${ALLOW_UNVERIFIED:-false}" != "true" ]; then
-    warn "Upstream не публикует контрольные суммы для этого релиза."
-    warn "SHA256: ${computed}"
-    warn "Для воспроизводимого обновления: TELEMT_SHA256=${computed} mtproto-proxy-manager update"
-    # в менеджере нет интерактивного confirm, поэтому принимаем без блокировки
-    warn "Продолжаю без проверки целостности."
-  else
-    warn "Установка без проверки целостности (ALLOW_UNVERIFIED=true)."
-  fi
-  tar -xzf "${tmp}/${asset}" -C "$tmp"
-  local extracted; extracted="$(find "$tmp" -maxdepth 2 -type f -name telemt | head -1 || true)"
-  [ -n "$extracted" ] || die "Бинарник не найден в архиве."
-  install -m 0755 "$extracted" "$BIN_PATH"
-}
-
-cmd_update() {
-  need_root
-  local target="${1:-latest}" ver
-  if [ "$target" = "latest" ]; then
-    ver="$(curl -fsS "https://api.github.com/repos/${TELEMT_REPO}/releases/latest" 2>/dev/null | jq -r '.tag_name' 2>/dev/null || true)"
-    [ -n "$ver" ] && [ "$ver" != "null" ] || die "Не удалось определить последнюю версию."
-  else
-    ver="$target"
-  fi
-  ok "Целевая версия: $ver"
-
-  if is_docker; then
-    cp -a "${CONF_DIR}/docker-compose.yml" "${BACKUP_DIR}/docker-compose.yml.$(date +%s)" 2>/dev/null || true
-    sed -i -E "s/(#)[0-9A-Za-z._-]+\$/#${ver}/" "${CONF_DIR}/docker-compose.yml" 2>/dev/null || true
-    dc up -d --build || die "Обновление контейнера не удалось."
-    ok "Контейнер обновлён до ${ver}."
+install_mtgctl() {
+  info "Installing mtgctl"
+  local script_dir src
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  src="${script_dir}/mtgctl"
+  if [[ -f "$src" ]]; then
+    install -m 0755 "$src" "$CTL_PATH"
+    ok "mtgctl installed from local repository"
     return
   fi
-
-  local bak
-  bak="${BACKUP_DIR}/telemt.bin.$(date +%s)"
-  install -d -m 0700 "$BACKUP_DIR"
-  cp -a "$BIN_PATH" "$bak"
-  if verify_and_install_binary "$ver"; then
-    systemctl restart "$SERVICE_NAME"
-    sleep 2
-    if systemctl is-active --quiet "$SERVICE_NAME"; then
-      ok "Обновлено до ${ver}. Старый бинарник: $bak"
-    else
-      warn "Сервис не поднялся — откат."
-      cp -a "$bak" "$BIN_PATH"; systemctl restart "$SERVICE_NAME"
-      die "Выполнен откат к предыдущей версии."
-    fi
-  fi
-}
-
-cmd_uninstall() {
-  need_root
-  echo "Будут удалены: сервис/контейнер, бинарник, файрвол-правило, этот manager."
-  read -r -p "Продолжить удаление? [y/N]: " a; [[ "$a" =~ ^[Yy]$ ]] || die "Отменено."
-
-  if is_docker; then dc down 2>/dev/null || true
+  if curl -fsSL --retry 2 -o "$CTL_PATH" "${REPO_RAW}/mtgctl" 2>/dev/null && [[ -s "$CTL_PATH" ]]; then
+    chmod 0755 "$CTL_PATH"
+    ok "mtgctl installed from ${REPO_RAW}"
   else
-    systemctl disable --now "$SERVICE_NAME" 2>/dev/null || true
-    rm -f "$UNIT_PATH"; systemctl daemon-reload 2>/dev/null || true
-    rm -f "$BIN_PATH"
+    warn "Cannot install mtgctl from local file or REPO_RAW. Proxy is installed; mtgctl is optional."
+    rm -f "$CTL_PATH"
   fi
-
-  case "${FW_BACKEND:-none}" in
-    ufw)       ufw delete allow "${PORT}/tcp" >/dev/null 2>&1 || true ;;
-    firewalld) firewall-cmd --permanent --remove-port="${PORT}/tcp" >/dev/null 2>&1 || true; firewall-cmd --reload >/dev/null 2>&1 || true ;;
-    iptables)  iptables -D INPUT -p tcp --dport "${PORT}" -j ACCEPT 2>/dev/null || true
-               command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1 || true ;;
-  esac
-  ok "Файрвол-правило для ${PORT}/tcp удалено (если было)."
-
-  if [ "${BBR_ENABLED:-false}" = "true" ] && [ -f /etc/sysctl.d/99-mtproto-bbr.conf ]; then
-    read -r -p "Удалить настройку BBR (/etc/sysctl.d/99-mtproto-bbr.conf)? [y/N]: " a
-    [[ "$a" =~ ^[Yy]$ ]] && { rm -f /etc/sysctl.d/99-mtproto-bbr.conf; sysctl --system >/dev/null 2>&1 || true; ok "BBR-настройка удалена."; }
-  fi
-
-  read -r -p "Удалить конфиги в ${CONF_DIR} (включая секреты)? [y/N]: " a
-  if [[ "$a" =~ ^[Yy]$ ]]; then rm -rf "$CONF_DIR"; ok "Конфиги удалены."; else warn "Конфиги сохранены в ${CONF_DIR}."; fi
-
-  read -r -p "Удалить системного пользователя ${PROXY_USER}? [y/N]: " a
-  [[ "$a" =~ ^[Yy]$ ]] && { userdel -r "$PROXY_USER" 2>/dev/null || true; ok "Пользователь удалён."; }
-
-  rm -f "$MANAGER_PATH"
-  ok "Удаление завершено."
 }
 
-usage() {
-  cat <<USAGE
-mtproto-proxy-manager — управление MTProto Proxy (telemt)
-
-  status         состояние сервиса
-  start          запустить
-  stop           остановить
-  restart        перезапустить
-  logs           показать логи (follow)
-  show-links     показать рабочие ссылки (ee/dd)
-  rotate-secret  сгенерировать новый secret, бэкап, перезапуск
-  update [ver]   обновить backend (по умолчанию latest), с проверкой и откатом
-  uninstall      удалить прокси
-USAGE
+public_ip() {
+  curl -4fsS --max-time 5 https://api.ipify.org 2>/dev/null \
+    || curl -4fsS --max-time 5 https://ifconfig.me 2>/dev/null \
+    || hostname -I 2>/dev/null | awk '{print $1}'
 }
 
-case "${1:-}" in
-  status)         cmd_status ;;
-  start)          cmd_start ;;
-  stop)           cmd_stop ;;
-  restart)        cmd_restart ;;
-  logs)           cmd_logs ;;
-  show-links)     cmd_show_links ;;
-  rotate-secret)  cmd_rotate_secret ;;
-  update)         shift; cmd_update "${1:-latest}" ;;
-  uninstall)      cmd_uninstall ;;
-  ""|-h|--help|help) usage ;;
-  *) die "Неизвестная команда: $1 (см. --help)";;
-esac
-MANAGER_EOF
-  chmod 755 "$MANAGER_PATH"
-  ok "Установлен менеджер: $MANAGER_PATH"
+get_secret() { grep -E '^secret' "$CONFIG_PATH" | head -1 | sed -E 's/.*"([^"]+)".*/\1/'; }
+
+show_access() {
+  local ip secret
+  ip="$(public_ip)"; ip="${ip:-<SERVER_IP>}"
+  secret="$(get_secret)"
+  printf '\n%s════════════ MTG proxy ready ════════════%s\n' "$c_grn" "$c_reset"
+  printf 'Server: %s\nPort:   %s/tcp\nMask domain: %s\n\n' "$ip" "$PORT" "$MASK_DOMAIN"
+  printf 'tg://proxy?server=%s&port=%s&secret=%s\n' "$ip" "$PORT" "$secret"
+  printf 'https://t.me/proxy?server=%s&port=%s&secret=%s\n\n' "$ip" "$PORT" "$secret"
+  info "Diagnostics: mtg doctor"
+  "$BIN_PATH" doctor "$CONFIG_PATH" 2>&1 | sed 's/^/    /' || warn "doctor reported warnings/errors"
 }
 
-# ----------------------------------------------------------------------------
-# Main
-# ----------------------------------------------------------------------------
-main() {
-  echo "${C_BLD}MTProto Proxy installer — Fake TLS (ee) / Secure (dd), backend: telemt${C_RST}"
-  echo
+rand_int() {
+  local min="$1" max="$2" n
+  n="$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
+  echo $(( min + n % (max - min + 1) ))
+}
 
-  # crude flag parsing
-  for arg in "$@"; do
-    case "$arg" in
-      --docker) DEPLOY="docker" ;;
-      --systemd) DEPLOY="systemd" ;;
-      --yes|-y) ASSUME_YES="true" ;;
-      --bbr) ENABLE_BBR="true" ;;
-      --no-bbr) ENABLE_BBR="false" ;;
-      *) ;;
-    esac
+unique_h_values() {
+  local vals=() v exists
+  while ((${#vals[@]} < 4)); do
+    v="$(rand_int 5 2147483647)"
+    exists=0
+    for x in "${vals[@]}"; do [[ "$x" == "$v" ]] && exists=1; done
+    [[ "$exists" -eq 0 ]] && vals+=("$v")
   done
-
-  require_root
-  detect_os
-  detect_arch
-  install_deps
-  resolve_telemt_version
-  gather_config
-
-  local secret; secret="$(gen_secret)"
-  create_user_dirs
-
-  if [ "$DEPLOY" = "docker" ]; then
-    deploy_docker "$secret"
-  else
-    telemt_download_verify "$TELEMT_VERSION" "$BIN_PATH"
-    write_config "$secret"
-    write_unit
-    setup_bbr
-    setup_firewall
-    start_systemd
-    healthcheck || warn "Healthcheck выявил проблемы — см. логи: mtproto-proxy-manager logs"
-  fi
-
-  # firewall/bbr also for docker (host networking)
-  if [ "$DEPLOY" = "docker" ]; then
-    setup_bbr
-    setup_firewall
-  fi
-
-  write_env
-  install_manager
-  fetch_links || true
-  print_summary "$secret"
+  printf '%s %s %s %s\n' "${vals[@]}"
 }
 
-main "$@"
+default_iface() { ip -4 route list default 2>/dev/null | awk '{print $5; exit}'; }
+
+random_awg_subnet() {
+  # Random /24 inside 10.0.0.0/8, avoiding 10.0.0.0/24 and 10.255.255.0/24.
+  printf '10.%s.%s.0/24\n' "$(rand_int 1 254)" "$(rand_int 0 255)"
+}
+
+select_awg_subnet() {
+  [[ "$INSTALL_AWG" -eq 1 ]] || return 0
+  if [[ -n "$AWG_SUBNET" ]]; then
+    validate_awg_subnet
+    return
+  fi
+  if [[ "$ASSUME_YES" -eq 1 ]]; then
+    AWG_SUBNET="$(random_awg_subnet)"
+    ok "No --awg-subnet provided in --yes mode; random AWG subnet selected: ${AWG_SUBNET}"
+    return
+  fi
+  cat <<EOF
+
+${c_bld}AmneziaWG private subnet${c_reset}
+You can specify a subnet inside 10.0.0.0/8, or let the installer pick a random /24.
+Example: 10.66.66.0/24
+EOF
+  local choice
+  read -rp "Use random subnet? [Y/n]: " choice
+  if [[ -z "$choice" || "$choice" =~ ^[Yy]$ ]]; then
+    AWG_SUBNET="$(random_awg_subnet)"
+    ok "Random AWG subnet selected: ${AWG_SUBNET}"
+  else
+    read -rp "AWG subnet CIDR: " AWG_SUBNET
+  fi
+  validate_awg_subnet
+}
+
+validate_awg_subnet() {
+  python3 - "$AWG_SUBNET" <<'PY'
+import sys, ipaddress
+raw = sys.argv[1]
+try:
+    net = ipaddress.ip_network(raw, strict=False)
+except Exception as e:
+    raise SystemExit(f"Invalid AWG subnet: {raw}: {e}")
+if net.version != 4:
+    raise SystemExit("AWG subnet must be IPv4")
+if not net.subnet_of(ipaddress.ip_network("10.0.0.0/8")):
+    raise SystemExit("AWG subnet must be inside 10.0.0.0/8")
+if net.prefixlen > 30:
+    raise SystemExit("AWG subnet must have at least two usable host addresses; /30 or larger is required")
+# valid
+PY
+}
+
+awg_addresses() {
+  python3 - "$AWG_SUBNET" <<'PY'
+import sys, ipaddress
+net = ipaddress.ip_network(sys.argv[1], strict=False)
+server = ipaddress.IPv4Address(int(net.network_address) + 1)
+client = ipaddress.IPv4Address(int(net.network_address) + 2)
+if server not in net or client not in net:
+    raise SystemExit("AWG subnet is too small")
+print(net.with_prefixlen, f"{server}/{net.prefixlen}", f"{client}/32", str(client))
+PY
+}
+
+install_amneziawg() {
+  [[ "$INSTALL_AWG" -eq 1 ]] || return 0
+  [[ "$OS_ID" == "ubuntu" ]] || die "Automatic AmneziaWG installation uses official Ubuntu PPA and currently requires Ubuntu."
+  validate_port_value "$AWG_PORT" "AWG port"
+  select_awg_subnet
+
+  info "Installing AmneziaWG packages from official PPA"
+  DEBIAN_FRONTEND=noninteractive apt-get install -y software-properties-common python3-launchpadlib gnupg2 dkms "linux-headers-$(uname -r)" iptables qrencode
+  add-apt-repository -y ppa:amnezia/ppa
+  add-apt-repository -y --enable-source ppa:amnezia/ppa >/dev/null 2>&1 || true
+  apt-get update -y
+  DEBIAN_FRONTEND=noninteractive apt-get install -y amneziawg
+  command -v awg >/dev/null 2>&1 || die "awg command not found after amneziawg install"
+
+  modprobe amneziawg >/dev/null 2>&1 || warn "modprobe amneziawg failed; DKMS may require reboot or kernel headers."
+
+  mkdir -p "$AWG_CONFIG_DIR" /etc/wireguard "$AWG_CLIENT_DIR"
+  chmod 700 "$AWG_CONFIG_DIR" "$AWG_CLIENT_DIR"
+
+  local server_priv server_pub client_priv client_pub psk iface ip awg_net awg_server_cidr awg_client_cidr awg_client_ip
+  server_priv="$(awg genkey)"; server_pub="$(printf '%s' "$server_priv" | awg pubkey)"
+  client_priv="$(awg genkey)"; client_pub="$(printf '%s' "$client_priv" | awg pubkey)"
+  psk="$(awg genpsk 2>/dev/null || openssl rand -base64 32)"
+  iface="$(default_iface)"; iface="${iface:-eth0}"
+  ip="$(public_ip)"; ip="${ip:-<SERVER_IP>}"
+  read -r awg_net awg_server_cidr awg_client_cidr awg_client_ip < <(awg_addresses)
+
+  local jc jmin jmax s1 s2 h1 h2 h3 h4
+  jc="$(rand_int 4 10)"; jmin="$(rand_int 64 128)"; jmax="$(rand_int 256 1024)"
+  s1="$(rand_int 15 64)"; s2="$(rand_int 15 64)"
+  read -r h1 h2 h3 h4 < <(unique_h_values)
+
+  cat > "$AWG_CONFIG_PATH" <<EOF
+[Interface]
+Address = ${awg_server_cidr}
+ListenPort = ${AWG_PORT}
+PrivateKey = ${server_priv}
+Jc = ${jc}
+Jmin = ${jmin}
+Jmax = ${jmax}
+S1 = ${s1}
+S2 = ${s2}
+H1 = ${h1}
+H2 = ${h2}
+H3 = ${h3}
+H4 = ${h4}
+PostUp = sysctl -w net.ipv4.ip_forward=1; iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -A POSTROUTING -o ${iface} -j MASQUERADE
+PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT; iptables -t nat -D POSTROUTING -o ${iface} -j MASQUERADE
+
+[Peer]
+PublicKey = ${client_pub}
+PresharedKey = ${psk}
+AllowedIPs = ${awg_client_cidr}
+EOF
+  chmod 600 "$AWG_CONFIG_PATH"
+  ln -sf "$AWG_CONFIG_PATH" /etc/wireguard/awg0.conf
+
+  local client_conf="${AWG_CLIENT_DIR}/${AWG_CLIENT_NAME}.conf"
+  cat > "$client_conf" <<EOF
+[Interface]
+PrivateKey = ${client_priv}
+Address = ${awg_client_cidr}
+DNS = 1.1.1.1, 8.8.8.8
+Jc = ${jc}
+Jmin = ${jmin}
+Jmax = ${jmax}
+S1 = ${s1}
+S2 = ${s2}
+H1 = ${h1}
+H2 = ${h2}
+H3 = ${h3}
+H4 = ${h4}
+
+[Peer]
+PublicKey = ${server_pub}
+PresharedKey = ${psk}
+Endpoint = ${ip}:${AWG_PORT}
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = 25
+EOF
+  chmod 600 "$client_conf"
+
+  cat > /etc/sysctl.d/99-awg-forward.conf <<'EOF'
+net.ipv4.ip_forward=1
+EOF
+  sysctl --system >/dev/null 2>&1 || true
+
+  systemctl enable --now awg-quick@awg0 >/dev/null 2>&1 || {
+    warn "awg-quick@awg0 failed to start. Check: journalctl -u awg-quick@awg0 -n 80 --no-pager"
+    return 0
+  }
+  ok "AmneziaWG is active on UDP ${AWG_PORT}; subnet ${awg_net}; client config: ${client_conf}"
+  if command -v qrencode >/dev/null 2>&1; then
+    printf '\n%sAmneziaWG client QR (%s):%s\n' "$c_grn" "$client_conf" "$c_reset"
+    qrencode -t ANSIUTF8 < "$client_conf" || true
+  fi
+}
+
+ssh_port() {
+  if command -v sshd >/dev/null 2>&1; then
+    sshd -T 2>/dev/null | awk '$1=="port" {print $2; exit}'
+  fi
+}
+
+configure_firewall() {
+  [[ "$ENABLE_FIREWALL" -eq 1 ]] || { warn "Firewall was not enabled. Re-run with --enable-firewall if needed."; return 0; }
+  command -v ufw >/dev/null 2>&1 || DEBIAN_FRONTEND=noninteractive apt-get install -y ufw
+  local sp; sp="$(ssh_port)"; sp="${sp:-22}"
+  info "Configuring UFW: allow SSH ${sp}/tcp, MTG ${PORT}/tcp$( [[ "$INSTALL_AWG" -eq 1 ]] && printf ', AWG %s/udp' "$AWG_PORT" )"
+  ufw --force reset >/dev/null 2>&1 || true
+  ufw default deny incoming
+  ufw default allow outgoing
+  ufw allow "${sp}/tcp" comment 'SSH'
+  ufw allow "${PORT}/tcp" comment 'MTG MTProto TCP'
+  if [[ "$INSTALL_AWG" -eq 1 ]]; then
+    ufw allow "${AWG_PORT}/udp" comment 'AmneziaWG UDP'
+  fi
+  ufw --force enable
+  ufw status verbose
+}
+
+do_prepare() {
+  require_root; detect_os; validate_ports
+  mkdir -p "$STATE_DIR"
+  handle_existing_mtproto
+  full_upgrade_system
+  ok "Prepare phase completed"
+  request_or_do_reboot
+}
+
+do_uninstall() {
+  require_root
+  info "Uninstalling MTG proxy"
+  local old_port=""
+  [[ -f "$CONFIG_PATH" ]] && old_port="$(grep -E '^bind-to' "$CONFIG_PATH" | sed -E 's/.*:([0-9]+).*/\1/' || true)"
+  systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
+  systemctl disable --now mtg-auto-update.timer >/dev/null 2>&1 || true
+  rm -f "$SERVICE_PATH" "$MTG_UPDATE_SERVICE" "$MTG_UPDATE_TIMER"
+  systemctl daemon-reload || true
+  if [[ -n "$old_port" ]] && command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    ufw delete allow "${old_port}/tcp" >/dev/null 2>&1 || true
+  fi
+  rm -f "$BIN_PATH" "$CONFIG_PATH" "$CTL_PATH"
+  if id -u "$RUN_USER" >/dev/null 2>&1; then userdel "$RUN_USER" >/dev/null 2>&1 || true; fi
+  ok "Removed MTG service, binary, config, mtgctl and auto-update timer. AWG is left untouched."
+}
+
+do_update() {
+  require_root; detect_os; ensure_deps
+  local arch tag; arch="$(detect_arch)"; tag="$(resolve_version)"
+  download_and_install_binary "$tag" "$arch"
+  if systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then
+    systemctl restart "$SERVICE_NAME"
+    ok "Service restarted"
+  fi
+}
+
+do_install() {
+  require_root; detect_os; validate_ports; ensure_deps
+  if [[ "$MODE" != "resume-install" && ! -f "$PREPARED_MARKER" ]]; then
+    warn "Prepare marker not found. Recommended: run --prepare and reboot before installation."
+    if [[ "$ASSUME_YES" -eq 0 ]] && confirm "Run prepare phase now?"; then do_prepare; fi
+  fi
+  handle_existing_mtproto
+  local arch tag; arch="$(detect_arch)"; tag="$(resolve_version)"
+  ok "Target: linux-${arch}; mtg version: ${tag}"
+  prompt_mask_domain; validate_mask_domain
+  check_port_free
+  download_and_install_binary "$tag" "$arch"
+  ensure_runtime_user
+  write_config
+  install_service
+  install_mtgctl
+  install_amneziawg
+  configure_firewall
+  setup_mtg_auto_update_timer
+  show_access
+}
+
+case "$MODE" in
+  prepare) do_prepare ;;
+  full) do_prepare ;;
+  resume-install|install) do_install ;;
+  update) do_update ;;
+  uninstall) do_uninstall ;;
+  *) die "Invalid mode: $MODE" ;;
+esac

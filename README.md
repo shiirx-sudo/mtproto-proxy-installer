@@ -1,217 +1,187 @@
-# MTProto Proxy Installer (Fake TLS `ee` / Secure `dd`)
+# mtproto-proxy-installer
 
-Установщик MTProto Proxy для Ubuntu/Debian VPS, ориентированный на практичную
-устойчивость к обнаружению DPI — **только на реально работающих механизмах**.
-Бэкенд по умолчанию: [`telemt`](https://github.com/telemt/telemt) (Rust + Tokio).
+## Short automatic install
 
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/USER/REPO/main/install.sh)
-```
-
-> ⚠️ Замените `USER/REPO` на свой форк после публикации репозитория.
-
----
-
-## 1. Что делает установщик
-
-- Разворачивает MTProto Proxy одной командой на Ubuntu 22.04 / 24.04 / Debian 12.
-- Включает **Fake TLS (`ee`)** как основной режим и **Secure (`dd`)** как fallback;
-  bare-secret (classic) по умолчанию **не выдаётся**.
-- Скачивает закреплённый релиз `telemt`, **проверяет контрольную сумму** перед установкой.
-- Создаёт отдельного системного пользователя и hardened-`systemd`-юнит
-  (без root; привязка к 443 через `CAP_NET_BIND_SERVICE`).
-- Настраивает маскировку: нераспознанные/неаутентифицированные соединения
-  **прозрачно перенаправляются на реальный HTTPS-сайт** (а не обрываются),
-  поэтому сканеру порт 443 выглядит как обычный веб-сервер.
-- Открывает в файрволе **только нужный порт** (ufw / firewalld / iptables), не ломая существующие правила.
-- Опционально: TCP BBR, нестандартный порт, Docker-режим.
-- Ставит утилиту управления `mtproto-proxy-manager`.
-
-## 2. Что он НЕ делает
-
-- **не** гарантирует необнаружимость DPI;
-- **не** заменяет полноценный VPN;
-- **не** реализует несуществующие/неподтверждённые методы обхода
-  (например, клиентские TCP-desync / `nfqws` / split-TLS — это **другой класс**
-  инструментов, работающих на клиенте/роутере, а не на серверном MTProxy);
-- **не** скрывает факт соединения с IP вашего VPS;
-- **не** защищает от блокировки самого IP-адреса сервера.
-
-## 3. Почему нет гарантии «невидимости»
-
-MTProto + Fake TLS **снижает** вероятность распознавания, имитируя TLS 1.3
-handshake к выбранному SNI и пряча характерные размеры пакетов. Но DPI всё ещё
-может действовать по другим признакам или просто блокировать по IP/порту/SNI.
-Формулировки вида «невидимый MTProto», «100% bypass», «undetectable» —
-технически нечестны и в этом проекте сознательно не используются.
-
-## 4. Режимы
-
-| Режим | Префикс | Назначение |
-|---|---|---|
-| Fake TLS | `ee` | основной — имитация TLS-handshake к маскировочному SNI |
-| Secure | `dd` | fallback — random padding (secure mode) |
-| Classic | — | **только диагностика**, включается через `INSECURE_DIAGNOSTIC_ONLY=true` |
-
-### Важное уточнение по терминологии
-
-Здесь два разных «домена»:
-
-- **Адрес подключения** (`server` в ссылке) — IP вашего VPS или домен с A-записью
-  на этот VPS. Нужен только для адресации/красивой ссылки.
-- **Маскировочный домен** (`tls_domain` / SNI) — реальный, доступный с сервера
-  HTTPS-сайт, под который маскируется трафик и куда уходят неаутентифицированные
-  соединения. Это **SNI-фронтинг / forwarding на реальный backend**, а **не**
-  классический domain fronting через CDN.
-
-## 5. Установка
+Default production install: MTG on `443/tcp`, AmneziaWG on `443/udp`, UFW enabled, auto-updates enabled, old MTProto/MTG removed, random `MASK_DOMAIN` from the built-in list, auto-reboot enabled.
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/USER/REPO/main/install.sh)
+curl -fsSL https://raw.githubusercontent.com/shiirx-sudo/mtproto-proxy-installer/main/quick-install.sh | sudo bash
 ```
 
-Полезные переменные окружения:
-
-| Переменная | По умолчанию | Назначение |
-|---|---|---|
-| `PORT` | `443` | порт прослушивания |
-| `CONN_HOST` | автоопределение IP | адрес в ссылке (IP или домен) |
-| `MASK_DOMAIN` | `vk.com` | маскировочный SNI (`tls_domain`) |
-| `TELEMT_VERSION` | `3.3.28` | версия бэкенда |
-| `TELEMT_SHA256` | — | закрепить контрольную сумму (надёжнее всего) |
-| `ALLOW_UNVERIFIED` | `false` | разрешить установку без проверки целостности |
-| `INSECURE_DIAGNOSTIC_ONLY` | `false` | включить classic bare-secret (диагностика) |
-| `DEPLOY` | `systemd` | `systemd` или `docker` |
-| `ENABLE_BBR` | `ask` | `ask` / `true` / `false` |
-| `ASSUME_YES` | `false` | неинтерактивный режим |
-
-Флаги: `--docker`, `--systemd`, `--yes`, `--bbr`, `--no-bbr`.
-
-### О контрольной сумме
-
-Установщик пытается найти опубликованный хеш (`<asset>.sha256` или `SHA256SUMS`
-в релизе). Если его нет, установщик **не выдумывает** хеш: он печатает SHA256
-скачанного файла и останавливается, предлагая перезапуститься с
-`TELEMT_SHA256=<хеш>` (если вы доверяете) или с `ALLOW_UNVERIFIED=true`.
-Сверяйте хеш с официальной страницей релиза telemt.
-
-## 6. Удаление
+With a fixed mask domain and AWG subnet:
 
 ```bash
-mtproto-proxy-manager uninstall
+curl -fsSL https://raw.githubusercontent.com/shiirx-sudo/mtproto-proxy-installer/main/quick-install.sh \
+  | sudo bash -s -- --mask-domain ya.ru --awg-subnet 10.66.66.0/24
 ```
 
-Удаляет сервис/контейнер, бинарник, файрвол-правило и сам менеджер.
-Конфиги (включая секреты), системный пользователь и настройка BBR удаляются
-**только после отдельного подтверждения**.
-
-## 7. Обновление
+Without AmneziaWG:
 
 ```bash
-mtproto-proxy-manager update          # до latest
-mtproto-proxy-manager update 3.3.28   # до конкретной версии
+curl -fsSL https://raw.githubusercontent.com/shiirx-sudo/mtproto-proxy-installer/main/quick-install.sh \
+  | sudo bash -s -- --no-awg
 ```
 
-Сохраняет `secret`/порт/домен, проверяет контрольную сумму, делает бэкап
-бинарника и **откатывается** на предыдущую версию, если сервис не поднялся.
-
-## 8. Ротация secret
+Without automatic reboot:
 
 ```bash
-mtproto-proxy-manager rotate-secret
+curl -fsSL https://raw.githubusercontent.com/shiirx-sudo/mtproto-proxy-installer/main/quick-install.sh \
+  | sudo bash -s -- --no-reboot
 ```
 
-Генерирует новый `secret`, делает датированный бэкап конфига, обновляет конфиг,
-перезапускает сервис и печатает новые ссылки.
+Full manual installer remains available through `install.sh`.
 
-> Смена secret/маскировочного домена делает старые ссылки нерабочими.
+Production installer for Telegram MTProto proxy through **MTG v2 FakeTLS** with optional **AmneziaWG** administrative VPN access.
 
-## 9. Проверка работоспособности
+## What it does
+
+- Checks for existing MTProto/MTG services, Docker containers and configs.
+- Can remove old MTProto/MTG installs before deployment.
+- Supports two-stage deployment: OS update → reboot → MTG/AWG install.
+- Installs MTG binary from GitHub release with SHA256 verification.
+- Runs MTG under a dedicated `mtg` system user through systemd.
+- Supports `MASK_DOMAIN`: your own FakeTLS/SNI domain, interactive selection, or random selection from a built-in list.
+- Optionally installs AmneziaWG on UDP `443`; MTG can use TCP `443` at the same time.
+- Supports custom AmneziaWG subnet through `--awg-subnet`, or random `/24` inside `10.0.0.0/8`.
+- Enables UFW firewall with only SSH, MTG TCP port and AWG UDP port allowed.
+- Enables unattended system updates and daily MTG update checks.
+
+## Recommended install from GitHub
+
+Download the script first. This is better than `curl | bash`, because reboot-resume needs a local installer file.
 
 ```bash
-mtproto-proxy-manager status
-systemctl is-active mtproto-proxy
-ss -lntp | grep ":443"
-journalctl -u mtproto-proxy --no-pager -n 50
-curl -k --connect-timeout 5 https://CONN_HOST:443/
+curl -fsSL https://raw.githubusercontent.com/shiirx-sudo/mtproto-proxy-installer/main/install.sh -o /root/mtg-install.sh
+chmod +x /root/mtg-install.sh
+sudo /root/mtg-install.sh \
+  --full \
+  --random-mask-domain \
+  --port 443 \
+  --install-awg \
+  --awg-port 443 \
+  --enable-firewall \
+  --auto-updates \
+  --auto-reboot \
+  --remove-existing \
+  --yes
 ```
 
-Признак исправной маскировки: подключение без секрета **не обрывается**, а
-получает ответ маскировочного сайта.
+With your own mask domain and AWG subnet:
 
-## 10. Частые проблемы
+```bash
+sudo /root/mtg-install.sh \
+  --full \
+  --mask-domain ya.ru \
+  --port 443 \
+  --install-awg \
+  --awg-port 443 \
+  --awg-subnet 10.66.66.0/24 \
+  --enable-firewall \
+  --auto-updates \
+  --auto-reboot \
+  --remove-existing \
+  --yes
+```
 
-- **Порт занят** — установщик покажет процесс и предложит другой порт / выход.
-  Чужие процессы **не убиваются автоматически**.
-- **Ссылка не работает на части клиентов** — поведение SNI/Fake TLS отличается
-  между клиентами (см. раздел 11).
-- **Маскировочный сайт недоступен с сервера** — выберите другой реальный,
-  не заблокированный HTTPS-домен.
-- **`Too many open files`** — `LimitNOFILE=65536` уже задан в юните; при больших
-  нагрузках поднимите системные лимиты.
-- **IP/порт/SNI заблокированы провайдером** — MTProxy в таких сетях работать не
-  будет (это ограничение протокола, не установщика).
+`--domain` is kept as a legacy alias for `--mask-domain`.
 
-## 11. Совместимость клиентов
+## Manual two-stage install
 
-Проверяйте ссылку на тех клиентах, которыми реально пользуетесь. Поведение
-SNI/Fake TLS между ними различается — например, в Telegram Desktop был
-зафиксирован issue, когда Desktop не отправлял SNI в fake-TLS-режиме, из-за чего
-SNI-роутинг мог не срабатывать (tdesktop #29664).
+```bash
+sudo ./install.sh --prepare --remove-existing --auto-updates --yes
+sudo reboot
+sudo ./install.sh --random-mask-domain --port 443 --install-awg --awg-port 443 --enable-firewall --auto-updates --yes
+```
 
-Заполняйте таблицу по факту ручной проверки:
+## Mask domain selection
 
-| Client | Version | Mode (ee/dd/classic) | Domain/IP | Result (works/not) | Notes |
-|---|---|---|---|---|---|
-| Telegram Android | | | | | |
-| Telegram iOS | | | | | |
-| Telegram Desktop | | | | | |
+If no `--mask-domain` is supplied:
 
-## 12. Безопасность
+- interactive mode asks whether to enter your own domain or pick a random one;
+- `--yes` mode automatically picks a random domain from the built-in list;
+- `--random-mask-domain` forces random selection.
 
-- отдельный системный пользователь, запуск **не от root**;
-- привязка к 443 через `CAP_NET_BIND_SERVICE`, без повышения привилегий
-  (`NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, …);
-- секреты в `/etc/mtproto-proxy/` с правами `600`, владелец — сервисный пользователь;
-- `secret` не печатается целиком в логах (показ — при установке и через `show-links`);
-- Control API telemt слушает **только localhost** (`127.0.0.1:9091`), наружу не открывается;
-- метрики Prometheus по умолчанию **выключены** (никаких лишних открытых портов);
-- проверка контрольной суммы релиза перед установкой;
-- идемпотентность: повторный запуск не ломает установку.
+Built-in candidates:
 
-## 13. Опции: BBR, нестандартный порт, Traefik, Docker, мониторинг
+```text
+max.ru
+storage.yandex.net
+yastatic.net
+ya.ru
+vk.com
+api.vk.com
+userapi.com
+vkuservideo.ru
+cdnvideo.ru
+okcdn.ru
+hosting.reg.ru
+cdn.ngenix.net
+```
 
-- **TCP BBR** — реальный тюнинг ядра, улучшает стабильность/скорость.
-  Это **не** метод анти-DPI. Включается опционально (`--bbr`).
-- **Нестандартный порт** (например `8443`) — допустим, но снижает «похожесть
-  на обычный HTTPS».
-- **Docker** — опциональная изоляция (`--docker`); собирается из официального
-  исходника telemt с дропнутыми capabilities. Это **опция, а не замена**
-  `systemd`-режима.
-- **Traefik / SNI-passthrough** — telemt можно поставить за Traefik (TLS-passthrough),
-  чтобы прокси соседствовал с легитимным веб-сервером на одном 443.
-  В этом установщике не автоматизировано; см. документацию telemt.
-- **Мониторинг (Prometheus)** — telemt отдаёт метрики; включайте их вручную
-  **только на localhost / закрытом интерфейсе**, без открытия внешних портов.
+The built-in list is tuned for RU-oriented connectivity. You can still override it with any real HTTPS domain using `--mask-domain`.
 
----
+## AmneziaWG subnet
 
-## Альтернативный бэкенд
+By default, when `--install-awg` is enabled and no subnet is provided:
 
-По умолчанию используется `telemt`. Можно вручную заменить на
-[`seriyps/mtproto_proxy`](https://github.com/seriyps/mtproto_proxy) (есть
-`mtp_fake_tls` и domain fronting). Автоматизация для seriyps в установщик не
-включена сознательно — чтобы не поставлять полу-рабочий код.
+- interactive mode asks whether to use a random subnet;
+- `--yes` mode automatically picks a random `/24` inside `10.0.0.0/8`.
 
-## Источники
+Example fixed subnet:
 
-- Telegram MTProxy — https://core.telegram.org/proxy
-- telemt — https://github.com/telemt/telemt
-- seriyps/mtproto_proxy — https://github.com/seriyps/mtproto_proxy
-- TelegramMessenger/MTProxy — https://github.com/TelegramMessenger/MTProxy
-- tdesktop issue #29664 (нет SNI в fake-TLS) — https://github.com/telegramdesktop/tdesktop/issues/29664
+```bash
+--awg-subnet 10.66.66.0/24
+```
 
-## Лицензия
+Generated addresses:
 
-MIT (см. `LICENSE`). Бэкенд `telemt` распространяется под собственной лицензией —
-см. репозиторий telemt.
+- server: first host, for example `10.66.66.1/24`;
+- first client: second host, for example `10.66.66.2/32`.
+
+The first AmneziaWG client config is saved to:
+
+```text
+/root/awg-clients/admin.conf
+```
+
+## Management
+
+```bash
+sudo mtgctl link
+sudo mtgctl status
+sudo mtgctl doctor
+sudo mtgctl logs
+sudo mtgctl update --latest
+sudo mtgctl mask-domain ya.ru
+sudo mtgctl awg-status
+sudo mtgctl awg-client admin
+```
+
+## Firewall policy
+
+With `--enable-firewall`:
+
+- default incoming: deny;
+- outgoing: allow;
+- SSH TCP port is detected through `sshd -T`, fallback is `22/tcp`;
+- MTG TCP port is allowed, default `443/tcp`;
+- if AmneziaWG is enabled, AWG UDP port is allowed, default `443/udp`.
+
+Using both MTG and AmneziaWG on port number `443` is valid because MTG uses TCP and AWG uses UDP.
+
+## Existing install detection
+
+The installer checks:
+
+- `mtg`, `mtproxy`, `mtproto-proxy`, `MTProxy`, `mtproto_proxy` systemd services;
+- `/usr/local/bin/mtg`, `/etc/mtg.toml`, `/etc/mtproxy`, `/etc/mtg`, `/opt/MTProxy`;
+- Docker containers/images matching `telegrammessenger/proxy`, `nineseconds/mtg`, `mtproto`, `mtproxy`, `mtg-proxy`.
+
+Removal is intentionally limited to known MTProto/MTG paths and services.
+
+## Notes
+
+- AmneziaWG automatic install targets Ubuntu through `ppa:amnezia/ppa`.
+- Automatic system updates do not automatically reboot the server.
+- MTG auto-update runs through `mtgctl update --latest` with checksum verification.
+- Do not commit real secrets, generated configs or client VPN profiles.

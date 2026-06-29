@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+# mtgctl — management helper for mtg MTProto proxy and optional AmneziaWG.
+set -Eeuo pipefail
+
+readonly MTG_REPO="9seconds/mtg"
+readonly BIN_PATH="/usr/local/bin/mtg"
+readonly CONFIG_PATH="/etc/mtg.toml"
+readonly SERVICE_NAME="mtg"
+readonly SERVICE_PATH="/etc/systemd/system/mtg.service"
+readonly RUN_USER="mtg"
+readonly RUN_GROUP="mtg"
+readonly AWG_CONFIG_PATH="/etc/amnezia/amneziawg/awg0.conf"
+readonly AWG_CLIENT_DIR="/root/awg-clients"
+
+c_reset=$'\033[0m'; c_red=$'\033[31m'; c_grn=$'\033[32m'; c_yel=$'\033[33m'; c_bld=$'\033[1m'
+info() { printf '%s[*]%s %s\n' "$c_grn" "$c_reset" "$*"; }
+warn() { printf '%s[!]%s %s\n' "$c_yel" "$c_reset" "$*" >&2; }
+die()  { printf '%s[x]%s %s\n' "$c_red" "$c_reset" "$*" >&2; exit 1; }
+need_root() { [[ "$(id -u)" -eq 0 ]] || die "Run with sudo: sudo mtgctl ${1:-}"; }
+need_install() { [[ -x "$BIN_PATH" && -f "$CONFIG_PATH" ]] || die "Proxy is not installed"; }
+
+get_port()   { grep -E '^bind-to' "$CONFIG_PATH" | sed -E 's/.*:([0-9]+).*/\1/'; }
+get_secret() { grep -E '^secret' "$CONFIG_PATH" | head -1 | sed -E 's/.*"([^"]+)".*/\1/'; }
+get_domain() {
+  local s; s="$(get_secret)"
+  python3 - "$s" 2>/dev/null <<'PY'
+import sys, binascii
+s = sys.argv[1]
+h = s[2:] if s.startswith("ee") else s
+try:
+    b = binascii.unhexlify(h)
+    print(b[16:].decode("latin1"))
+except Exception:
+    print("?")
+PY
+}
+public_ip() {
+  curl -4fsS --max-time 5 https://api.ipify.org 2>/dev/null \
+    || curl -4fsS --max-time 5 https://ifconfig.me 2>/dev/null \
+    || hostname -I 2>/dev/null | awk '{print $1}'
+}
+
+detect_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64) echo amd64 ;; aarch64|arm64) echo arm64 ;;
+    armv7l|armv7) echo armv7 ;; armv6l|armv6) echo armv6 ;; i686|i386) echo 386 ;;
+    *) die "Unsupported architecture" ;;
+  esac
+}
+resolve_latest() {
+  curl -fsSL "https://api.github.com/repos/${MTG_REPO}/releases/latest" \
+    | grep -oE '"tag_name":[[:space:]]*"[^"]+"' \
+    | head -1 | sed -E 's/.*"([^"]+)"$/\1/'
+}
+
+download_binary() {
+  local tag="$1" arch="$2" skip="${3:-0}"
+  local ver="${tag#v}" asset="mtg-${ver}-linux-${arch}.tar.gz" sums="mtg-${ver}-checksums.txt"
+  local base="https://github.com/${MTG_REPO}/releases/download/${tag}" tmp
+  tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' RETURN
+  curl -fSL --retry 3 -o "${tmp}/${asset}" "${base}/${asset}" || die "Download failed"
+  if curl -fSL --retry 3 -o "${tmp}/${sums}" "${base}/${sums}" 2>/dev/null; then
+    local exp act; exp="$(awk -v a="$asset" '$2 == a {print $1; exit}' "${tmp}/${sums}")"
+    if [[ -z "$exp" && "$skip" != "1" ]]; then die "No checksum entry for ${asset}"; fi
+    if [[ -n "$exp" ]]; then
+      act="$(sha256sum "${tmp}/${asset}" | awk '{print $1}')"
+      [[ "$exp" == "$act" ]] || die "sha256 mismatch"
+    fi
+  elif [[ "$skip" != "1" ]]; then
+    die "Checksum file unavailable"
+  fi
+  tar -xzf "${tmp}/${asset}" -C "$tmp"
+  local f; f="$(find "$tmp" -type f -name mtg -perm /111 | head -1)"; [[ -n "$f" ]] || die "mtg binary not found"
+  install -m 0755 "$f" "$BIN_PATH"
+}
+
+cmd_link() {
+  need_install
+  local ip port secret; ip="$(public_ip)"; port="$(get_port)"; secret="$(get_secret)"
+  printf '%sConnection:%s\n' "$c_bld" "$c_reset"
+  printf '  Server: %s   Port: %s/tcp   Mask domain: %s\n' "${ip:-?}" "$port" "$(get_domain)"
+  printf '  tg://proxy?server=%s&port=%s&secret=%s\n' "$ip" "$port" "$secret"
+  printf '  https://t.me/proxy?server=%s&port=%s&secret=%s\n' "$ip" "$port" "$secret"
+}
+cmd_status() { need_install; systemctl status "$SERVICE_NAME" --no-pager -l || true; echo; "$BIN_PATH" doctor "$CONFIG_PATH" || true; }
+cmd_doctor() { need_install; "$BIN_PATH" doctor "$CONFIG_PATH"; }
+cmd_logs() { need_root logs; journalctl -u "$SERVICE_NAME" -f --no-pager; }
+cmd_secret() { need_root secret; need_install; get_secret; }
+cmd_restart() { need_root restart; systemctl restart "$SERVICE_NAME"; info "Restarted"; }
+cmd_stop() { need_root stop; systemctl stop "$SERVICE_NAME"; info "Stopped"; }
+cmd_start() { need_root start; systemctl start "$SERVICE_NAME"; info "Started"; }
+
+cmd_mask_domain() {
+  need_root mask-domain; need_install
+  local d="${1:?Usage: sudo mtgctl mask-domain www.cloudflare.com}"
+  [[ "$d" =~ ^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] || die "Invalid domain: $d"
+  local secret; secret="$("$BIN_PATH" generate-secret --hex "$d")" || die "Cannot generate secret"
+  sed -i -E "s|^secret = \".*\"|secret = \"${secret}\"|" "$CONFIG_PATH"
+  chown root:"$RUN_GROUP" "$CONFIG_PATH"; chmod 0640 "$CONFIG_PATH"
+  systemctl restart "$SERVICE_NAME"
+  info "Mask domain changed to ${d}. New link:"; cmd_link
+}
+
+cmd_port() {
+  need_root port; need_install
+  local newp="${1:?Usage: sudo mtgctl port 8443}"
+  [[ "$newp" =~ ^[0-9]+$ ]] && (( newp>=1 && newp<=65535 )) || die "Invalid port: $newp"
+  local oldp; oldp="$(get_port)"
+  sed -i -E "s|^bind-to = \"0.0.0.0:[0-9]+\"|bind-to = \"0.0.0.0:${newp}\"|" "$CONFIG_PATH"
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    ufw allow "${newp}/tcp" >/dev/null 2>&1 || true
+    [[ -n "$oldp" && "$oldp" != "$newp" ]] && ufw delete allow "${oldp}/tcp" >/dev/null 2>&1 || true
+  fi
+  systemctl restart "$SERVICE_NAME"
+  info "Port changed ${oldp} -> ${newp}. New link:"; cmd_link
+}
+
+cmd_update() {
+  need_root update; need_install
+  local tag="${1:-}"
+  if [[ -z "$tag" || "$tag" == "--latest" ]]; then tag="$(resolve_latest)" || die "Cannot resolve latest"; fi
+  local arch; arch="$(detect_arch)"
+  info "Updating mtg to ${tag}"
+  download_binary "$tag" "$arch" 0
+  systemctl restart "$SERVICE_NAME"
+  info "Updated and restarted: $("$BIN_PATH" --version 2>/dev/null | head -1 || echo "$tag")"
+}
+
+cmd_awg_status() {
+  systemctl status awg-quick@awg0 --no-pager -l || true
+  if command -v awg >/dev/null 2>&1; then awg show awg0 || true; fi
+}
+cmd_awg_client() {
+  need_root awg-client
+  local name="${1:-admin}"
+  local file="${AWG_CLIENT_DIR}/${name}.conf"
+  [[ -f "$file" ]] || die "Client config not found: $file"
+  cat "$file"
+  if command -v qrencode >/dev/null 2>&1; then qrencode -t ANSIUTF8 < "$file" || true; fi
+}
+
+cmd_uninstall() {
+  need_root uninstall
+  local p=""; [[ -f "$CONFIG_PATH" ]] && p="$(get_port || true)"
+  systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
+  systemctl disable --now mtg-auto-update.timer >/dev/null 2>&1 || true
+  rm -f "$SERVICE_PATH" /etc/systemd/system/mtg-auto-update.service /etc/systemd/system/mtg-auto-update.timer
+  systemctl daemon-reload || true
+  if [[ -n "$p" ]] && command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    ufw delete allow "${p}/tcp" >/dev/null 2>&1 || true
+  fi
+  rm -f "$BIN_PATH" "$CONFIG_PATH" /usr/local/bin/mtgctl
+  if id -u "$RUN_USER" >/dev/null 2>&1; then userdel "$RUN_USER" >/dev/null 2>&1 || true; fi
+  info "MTG proxy removed. AmneziaWG is left untouched."
+}
+
+usage() {
+  cat <<EOF
+${c_bld}mtgctl${c_reset}
+  link                    show Telegram proxy links
+  status                  systemd status + mtg doctor
+  doctor                  mtg doctor only
+  logs                    live MTG logs
+  secret                  print secret, root only
+  start|stop|restart      manage MTG service
+  mask-domain <host>      rotate secret for new FakeTLS mask domain
+  domain <host>           legacy alias for mask-domain
+  port <port>             change MTG bind/public TCP port
+  update [vX.Y.Z|--latest] update binary with checksum verification
+  awg-status              AmneziaWG service status
+  awg-client [name]       print AmneziaWG client config and QR
+  uninstall               remove MTG only
+EOF
+}
+
+case "${1:-help}" in
+  link) cmd_link ;; status) cmd_status ;; doctor) cmd_doctor ;; logs) cmd_logs ;; secret) cmd_secret ;;
+  start) cmd_start ;; stop) cmd_stop ;; restart) cmd_restart ;;
+  mask-domain|domain) shift; cmd_mask_domain "${1:-}" ;; port) shift; cmd_port "${1:-}" ;;
+  update) shift; cmd_update "${1:-}" ;;
+  awg-status) cmd_awg_status ;; awg-client) shift; cmd_awg_client "${1:-admin}" ;;
+  uninstall) cmd_uninstall ;;
+  help|-h|--help) usage ;; *) warn "Unknown command: $1"; usage; exit 1 ;;
+esac

@@ -49,6 +49,31 @@ safe_rm_tmp() {
   rm -rf "$path"
 }
 
+bytes_available_on_path() {
+  local path="${1:-/}"
+  df -PB1 "$path" | awk 'NR==2 {print $4}'
+}
+
+require_free_space() {
+  local path="${1:-/}"
+  local required_mb="${2:-1024}"
+  local required_bytes=$((required_mb * 1024 * 1024))
+  local available_bytes
+  available_bytes="$(bytes_available_on_path "$path" 2>/dev/null || echo 0)"
+
+  if (( available_bytes < required_bytes )); then
+    warn "Not enough free disk space on ${path}. Required: ${required_mb} MB; available: $((available_bytes / 1024 / 1024)) MB"
+    warn "Try: apt-get clean; rm -rf /var/lib/apt/lists/* /var/cache/man/* /tmp/* /var/tmp/*"
+    die "Insufficient disk space"
+  fi
+}
+
+cleanup_apt_caches() {
+  info "Cleaning APT caches"
+  apt_get_safe clean || true
+  rm -rf /var/cache/apt/archives/*.deb /var/cache/apt/archives/partial/* || true
+}
+
 
 readonly MTG_REPO="9seconds/mtg"
 readonly BIN_PATH="/usr/local/bin/mtg"
@@ -229,7 +254,8 @@ detect_arch() {
 
 apt_install_base_deps() {
   local deps=(ca-certificates curl tar coreutils iproute2 gawk sed grep findutils python3 openssl ufw fail2ban unattended-upgrades apt-listchanges)
-  info "Installing base dependencies"
+  require_free_space / 512
+info "Installing base dependencies"
   apt_get_safe update -y
   apt_get_safe install -y "${deps[@]}"
   systemctl enable --now fail2ban >/dev/null 2>&1 || true
@@ -798,12 +824,16 @@ install_amneziawg() {
   validate_port_value "$AWG_PORT" "AWG port"
   select_awg_subnet
 
+  require_free_space / 1200
+  cleanup_apt_caches
+  require_free_space / 1000
   info "Installing AmneziaWG packages from official PPA"
   apt_get_safe install -y software-properties-common python3-launchpadlib gnupg2 dkms "linux-headers-$(uname -r)" iptables qrencode
   add-apt-repository -y ppa:amnezia/ppa
   add-apt-repository -y --enable-source ppa:amnezia/ppa >/dev/null 2>&1 || true
   apt_get_safe update -y
   apt_get_safe install -y amneziawg
+  cleanup_apt_caches
   command -v awg >/dev/null 2>&1 || die "awg command not found after amneziawg install"
 
   modprobe amneziawg >/dev/null 2>&1 || warn "modprobe amneziawg failed; DKMS may require reboot or kernel headers."

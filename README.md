@@ -211,3 +211,21 @@ Fixed a final cleanup bug under `set -u` where an unset temporary variable could
 ```
 
 This happened after service installation/diagnostics and did not necessarily mean MTG or AmneziaWG failed.
+
+
+## v9 note
+
+Added disk-space preflight checks before package installation:
+
+- at least 512 MB free before base dependencies;
+- at least 1.0-1.2 GB free before AmneziaWG/DKMS installation;
+- APT cache cleanup before and after AmneziaWG package installation.
+
+This prevents failures like:
+
+```text
+No space left on device
+E: Unable to locate package amneziawg
+```
+
+where the real cause is that APT could not write repository indexes after the disk filled up.

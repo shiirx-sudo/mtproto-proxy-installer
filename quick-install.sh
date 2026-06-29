@@ -27,7 +27,7 @@ Usage:
 
 Options:
   --mask-domain DOMAIN      Use specific MTG FakeTLS mask domain
-  --random-mask-domain      Use random domain from the built-in list (default)
+  --random-mask-domain      Use random domain from built-in list (default)
   --port PORT               MTG TCP port, default: 443
   --awg-port PORT           AmneziaWG UDP port, default: 443
   --awg-subnet CIDR         AmneziaWG subnet, e.g. 10.66.66.0/24
@@ -35,8 +35,8 @@ Options:
   --no-firewall             Do not enable UFW
   --no-reboot               Do not auto-reboot after preparation
   --no-auto-updates         Do not configure automatic updates
+  --full-system-upgrade     Run apt-get full-upgrade before installation (not default)
   --keep-existing           Do not remove existing MTProto/MTG installs
-  --full-system-upgrade     Run apt-get full-upgrade before installing
   -h, --help                Show help
 
 Environment variables are also supported:

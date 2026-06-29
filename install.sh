@@ -3,6 +3,35 @@
 # Optional: AmneziaWG VPN access, UFW firewall, automatic updates, two-stage reboot flow.
 set -Eeuo pipefail
 
+wait_for_apt_locks() {
+  local waited=0
+  local max_wait="${APT_LOCK_TIMEOUT:-900}"
+  local pids=""
+
+  while true; do
+    pids="$(pgrep -x apt apt-get dpkg unattended-upgr packagekitd 2>/dev/null | tr '\n' ' ' || true)"
+    if [[ -z "$pids" ]]; then
+      return 0
+    fi
+
+    if (( waited >= max_wait )); then
+      warn "APT/dpkg is still busy after ${max_wait}s. Active processes:"
+      ps -fp $pids || true
+      die "APT/dpkg lock timeout. Wait for package operations to finish, then rerun the installer."
+    fi
+
+    warn "APT/dpkg is busy; waiting 10s. Active PIDs: ${pids}"
+    sleep 10
+    waited=$((waited + 10))
+  done
+}
+
+apt_get_safe() {
+  wait_for_apt_locks
+  DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get "$@"
+}
+
+
 readonly MTG_REPO="9seconds/mtg"
 readonly BIN_PATH="/usr/local/bin/mtg"
 readonly CTL_PATH="/usr/local/bin/mtgctl"
@@ -78,7 +107,7 @@ If you do not want automatic reboot/resume:
   sudo ./install.sh --mask-domain ya.ru --port 443 --install-awg --enable-firewall --auto-updates --yes
 
 Options:
-  --prepare             Update package lists/dependencies, optionally remove old MTProto, then reboot/exit
+  --prepare             Prepare dependencies, optionally remove old MTProto, then reboot/exit
   --full                Prepare first, then resume installation after reboot when --auto-reboot is set
   --resume-install      Internal mode used by reboot-resume service
   --mask-domain <host>  FakeTLS/SNI mask domain, e.g. ya.ru
@@ -93,8 +122,8 @@ Options:
   --awg-subnet <CIDR>   AmneziaWG private subnet inside 10.0.0.0/8, e.g. 10.66.66.0/24
   --awg-client <name>   First AmneziaWG client config name, default ${AWG_CLIENT_NAME}
   --enable-firewall     Enable UFW: deny incoming; allow SSH, MTG TCP port, and AWG UDP port when enabled
-  --auto-updates        Enable unattended system updates + daily mtg update timer
-  --full-system-upgrade Run apt-get full-upgrade during prepare; opt-in for fresh VPS/kernel upgrades
+  --auto-updates        Enable unattended system security updates + daily mtg update timer
+  --full-system-upgrade Run apt-get full-upgrade during prepare phase. Optional; not default.
   --auto-reboot         In --prepare/--full mode: install resume service and reboot automatically
   --remove-existing     Remove known existing MTProto/MTG installs before installing
   -y, --yes             Non-interactive mode
@@ -183,8 +212,8 @@ detect_arch() {
 apt_install_base_deps() {
   local deps=(ca-certificates curl tar coreutils iproute2 gawk sed grep findutils python3 openssl ufw fail2ban unattended-upgrades apt-listchanges)
   info "Installing base dependencies"
-  apt-get update -y
-  DEBIAN_FRONTEND=noninteractive apt-get install -y "${deps[@]}"
+  apt_get_safe update -y
+  apt_get_safe install -y "${deps[@]}"
   systemctl enable --now fail2ban >/dev/null 2>&1 || true
   timedatectl set-ntp true >/dev/null 2>&1 || true
 }
@@ -202,14 +231,14 @@ ensure_deps() {
   if ! command -v python3 >/dev/null 2>&1; then need+=(python3); fi
   if ((${#need[@]})); then
     info "Installing dependencies: ${need[*]}"
-    apt-get update -y
-    DEBIAN_FRONTEND=noninteractive apt-get install -y "${need[@]}"
+    apt_get_safe update -y
+    apt_get_safe install -y "${need[@]}"
   fi
 }
 
 setup_unattended_upgrades() {
   info "Enabling unattended system security updates"
-  DEBIAN_FRONTEND=noninteractive apt-get install -y unattended-upgrades apt-listchanges
+  apt_get_safe install -y unattended-upgrades apt-listchanges
   cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
@@ -260,15 +289,23 @@ EOF
 }
 
 prepare_system_packages() {
-  info "Updating package lists and installing required packages"
-  apt-get update -y
   if [[ "$FULL_SYSTEM_UPGRADE" -eq 1 ]]; then
-    warn "Running full system upgrade because --full-system-upgrade was set"
-    DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y
+    info "Running full system upgrade because --full-system-upgrade was set"
+    apt_get_safe update -y
+    apt_get_safe full-upgrade -y
   else
-    ok "Skipping full system upgrade; use --full-system-upgrade when you explicitly want kernel/system upgrades"
+    info "Minimal prepare mode: updating package lists and installing required dependencies only"
+    apt_get_safe update -y
   fi
+
   apt_install_base_deps
+
+  if [[ "$INSTALL_AWG" -eq 1 ]]; then
+    info "Installing current kernel headers for AmneziaWG"
+    apt_get_safe install -y "linux-headers-$(uname -r)" || \
+      warn "Could not install linux-headers-$(uname -r). AmneziaWG DKMS install may fail; consider --full-system-upgrade + reboot."
+  fi
+
   if [[ "$AUTO_UPDATES" -eq 1 ]]; then setup_unattended_upgrades; fi
 }
 
@@ -744,11 +781,11 @@ install_amneziawg() {
   select_awg_subnet
 
   info "Installing AmneziaWG packages from official PPA"
-  DEBIAN_FRONTEND=noninteractive apt-get install -y software-properties-common python3-launchpadlib gnupg2 dkms "linux-headers-$(uname -r)" iptables qrencode
+  apt_get_safe install -y software-properties-common python3-launchpadlib gnupg2 dkms "linux-headers-$(uname -r)" iptables qrencode
   add-apt-repository -y ppa:amnezia/ppa
   add-apt-repository -y --enable-source ppa:amnezia/ppa >/dev/null 2>&1 || true
-  apt-get update -y
-  DEBIAN_FRONTEND=noninteractive apt-get install -y amneziawg
+  apt_get_safe update -y
+  apt_get_safe install -y amneziawg
   command -v awg >/dev/null 2>&1 || die "awg command not found after amneziawg install"
 
   modprobe amneziawg >/dev/null 2>&1 || warn "modprobe amneziawg failed; DKMS may require reboot or kernel headers."
@@ -843,7 +880,7 @@ ssh_port() {
 
 configure_firewall() {
   [[ "$ENABLE_FIREWALL" -eq 1 ]] || { warn "Firewall was not enabled. Re-run with --enable-firewall if needed."; return 0; }
-  command -v ufw >/dev/null 2>&1 || DEBIAN_FRONTEND=noninteractive apt-get install -y ufw
+  command -v ufw >/dev/null 2>&1 || apt_get_safe install -y ufw
   local sp; sp="$(ssh_port)"; sp="${sp:-22}"
   info "Configuring UFW: allow SSH ${sp}/tcp, MTG ${PORT}/tcp$( [[ "$INSTALL_AWG" -eq 1 ]] && printf ', AWG %s/udp' "$AWG_PORT" )"
   ufw --force reset >/dev/null 2>&1 || true

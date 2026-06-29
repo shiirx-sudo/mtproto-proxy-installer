@@ -193,7 +193,7 @@ Removal is intentionally limited to known MTProto/MTG paths and services.
 
 ## Package lock handling
 
-The installer now waits for active `apt`, `apt-get`, `dpkg`, `unattended-upgrades`, or `packagekitd` processes before package operations. Default timeout is 900 seconds and can be changed with:
+The installer waits for actual APT/dpkg lock holders using `fuser` on package-manager lock files. It does not treat long-lived helper processes such as `unattended-upgrade-shutdown --wait-for-signal` as package activity. Default timeout is 900 seconds and can be changed with:
 
 ```bash
 APT_LOCK_TIMEOUT=1800 curl -fsSL https://raw.githubusercontent.com/shiirx-sudo/mtproto-proxy-installer/main/quick-install.sh | sudo bash

@@ -6,21 +6,30 @@ set -Eeuo pipefail
 wait_for_apt_locks() {
   local waited=0
   local max_wait="${APT_LOCK_TIMEOUT:-900}"
-  local pids=""
+  local holders=""
 
   while true; do
-    pids="$(pgrep -x apt apt-get dpkg unattended-upgr packagekitd 2>/dev/null | tr '\n' ' ' || true)"
-    if [[ -z "$pids" ]]; then
+    holders="$(
+      {
+        fuser /var/lib/dpkg/lock-frontend \
+              /var/lib/dpkg/lock \
+              /var/cache/apt/archives/lock \
+              /var/lib/apt/lists/lock 2>/dev/null || true
+      } | tr '\n' ' ' | xargs -r
+    )"
+
+    if [[ -z "$holders" ]]; then
       return 0
     fi
 
     if (( waited >= max_wait )); then
-      warn "APT/dpkg is still busy after ${max_wait}s. Active processes:"
-      ps -fp $pids || true
-      die "APT/dpkg lock timeout. Wait for package operations to finish, then rerun the installer."
+      warn "APT/dpkg lock is still held after ${max_wait}s. Lock holder PIDs: ${holders}"
+      ps -fp ${holders} || true
+      die "APT/dpkg lock timeout. Wait for real package operations to finish, then rerun the installer."
     fi
 
-    warn "APT/dpkg is busy; waiting 10s. Active PIDs: ${pids}"
+    warn "APT/dpkg lock is held; waiting 10s. Lock holder PIDs: ${holders}"
+    ps -fp ${holders} || true
     sleep 10
     waited=$((waited + 10))
   done

@@ -36,6 +36,7 @@ AUTO_REBOOT=0
 REMOVE_EXISTING=0
 ENABLE_FIREWALL=0
 AUTO_UPDATES=0
+FULL_SYSTEM_UPGRADE=0
 INSTALL_AWG=0
 AWG_PORT="${AWG_PORT:-443}"
 AWG_SUBNET="${AWG_SUBNET:-}"
@@ -77,7 +78,7 @@ If you do not want automatic reboot/resume:
   sudo ./install.sh --mask-domain ya.ru --port 443 --install-awg --enable-firewall --auto-updates --yes
 
 Options:
-  --prepare             Update OS/dependencies, optionally remove old MTProto, then reboot/exit
+  --prepare             Update package lists/dependencies, optionally remove old MTProto, then reboot/exit
   --full                Prepare first, then resume installation after reboot when --auto-reboot is set
   --resume-install      Internal mode used by reboot-resume service
   --mask-domain <host>  FakeTLS/SNI mask domain, e.g. ya.ru
@@ -93,6 +94,7 @@ Options:
   --awg-client <name>   First AmneziaWG client config name, default ${AWG_CLIENT_NAME}
   --enable-firewall     Enable UFW: deny incoming; allow SSH, MTG TCP port, and AWG UDP port when enabled
   --auto-updates        Enable unattended system updates + daily mtg update timer
+  --full-system-upgrade Run apt-get full-upgrade during prepare; opt-in for fresh VPS/kernel upgrades
   --auto-reboot         In --prepare/--full mode: install resume service and reboot automatically
   --remove-existing     Remove known existing MTProto/MTG installs before installing
   -y, --yes             Non-interactive mode
@@ -122,6 +124,7 @@ while [[ $# -gt 0 ]]; do
     --random-mask-domain) RANDOM_MASK_DOMAIN=1; shift ;;
     --enable-firewall) ENABLE_FIREWALL=1; shift ;;
     --auto-updates) AUTO_UPDATES=1; shift ;;
+    --full-system-upgrade) FULL_SYSTEM_UPGRADE=1; shift ;;
     --auto-reboot) AUTO_REBOOT=1; shift ;;
     --remove-existing) REMOVE_EXISTING=1; shift ;;
     -y|--yes) ASSUME_YES=1; shift ;;
@@ -256,10 +259,15 @@ EOF
   ok "mtg-auto-update.timer enabled"
 }
 
-full_upgrade_system() {
-  info "Updating package lists and upgrading the system"
+prepare_system_packages() {
+  info "Updating package lists and installing required packages"
   apt-get update -y
-  DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y
+  if [[ "$FULL_SYSTEM_UPGRADE" -eq 1 ]]; then
+    warn "Running full system upgrade because --full-system-upgrade was set"
+    DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y
+  else
+    ok "Skipping full system upgrade; use --full-system-upgrade when you explicitly want kernel/system upgrades"
+  fi
   apt_install_base_deps
   if [[ "$AUTO_UPDATES" -eq 1 ]]; then setup_unattended_upgrades; fi
 }
@@ -854,7 +862,7 @@ do_prepare() {
   require_root; detect_os; validate_ports
   mkdir -p "$STATE_DIR"
   handle_existing_mtproto
-  full_upgrade_system
+  prepare_system_packages
   ok "Prepare phase completed"
   request_or_do_reboot
 }

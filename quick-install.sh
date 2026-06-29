@@ -14,6 +14,7 @@ ENABLE_FIREWALL="${ENABLE_FIREWALL:-1}"
 AUTO_REBOOT="${AUTO_REBOOT:-1}"
 AUTO_UPDATES="${AUTO_UPDATES:-1}"
 REMOVE_EXISTING="${REMOVE_EXISTING:-1}"
+FULL_SYSTEM_UPGRADE="${FULL_SYSTEM_UPGRADE:-0}"
 
 log() { printf '\033[1;32m[+]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*"; }
@@ -35,6 +36,7 @@ Options:
   --no-reboot               Do not auto-reboot after preparation
   --no-auto-updates         Do not configure automatic updates
   --keep-existing           Do not remove existing MTProto/MTG installs
+  --full-system-upgrade     Run apt-get full-upgrade before installing
   -h, --help                Show help
 
 Environment variables are also supported:
@@ -66,6 +68,8 @@ while [[ $# -gt 0 ]]; do
       AUTO_UPDATES=0; shift ;;
     --keep-existing)
       REMOVE_EXISTING=0; shift ;;
+    --full-system-upgrade)
+      FULL_SYSTEM_UPGRADE=1; shift ;;
     -h|--help)
       usage; exit 0 ;;
     *)
@@ -108,6 +112,10 @@ fi
 
 if [[ "${REMOVE_EXISTING}" == "1" ]]; then
   args+=(--remove-existing)
+fi
+
+if [[ "${FULL_SYSTEM_UPGRADE}" == "1" ]]; then
+  args+=(--full-system-upgrade)
 fi
 
 log "Running installer:"

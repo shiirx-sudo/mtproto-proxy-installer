@@ -4,6 +4,8 @@
 
 Default production install: MTG on `443/tcp`, AmneziaWG on `443/udp`, UFW enabled, auto-updates enabled, old MTProto/MTG removed, random `MASK_DOMAIN` from the built-in list, auto-reboot enabled.
 
+The default path does not run `apt-get full-upgrade`. It updates package lists and installs only the packages needed for MTG/AmneziaWG deployment.
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/shiirx-sudo/mtproto-proxy-installer/main/quick-install.sh | sudo bash
 ```
@@ -29,6 +31,13 @@ curl -fsSL https://raw.githubusercontent.com/shiirx-sudo/mtproto-proxy-installer
   | sudo bash -s -- --no-reboot
 ```
 
+With an explicit full system upgrade, useful for fresh VPSes where you want kernel/system packages upgraded before deployment:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/shiirx-sudo/mtproto-proxy-installer/main/quick-install.sh \
+  | sudo bash -s -- --full-system-upgrade
+```
+
 Full manual installer remains available through `install.sh`.
 
 Production installer for Telegram MTProto proxy through **MTG v2 FakeTLS** with optional **AmneziaWG** administrative VPN access.
@@ -37,7 +46,7 @@ Production installer for Telegram MTProto proxy through **MTG v2 FakeTLS** with 
 
 - Checks for existing MTProto/MTG services, Docker containers and configs.
 - Can remove old MTProto/MTG installs before deployment.
-- Supports two-stage deployment: OS update → reboot → MTG/AWG install.
+- Supports two-stage deployment: dependency preparation -> reboot/resume -> MTG/AWG install.
 - Installs MTG binary from GitHub release with SHA256 verification.
 - Runs MTG under a dedicated `mtg` system user through systemd.
 - Supports `MASK_DOMAIN`: your own FakeTLS/SNI domain, interactive selection, or random selection from a built-in list.
@@ -91,6 +100,12 @@ sudo /root/mtg-install.sh \
 sudo ./install.sh --prepare --remove-existing --auto-updates --yes
 sudo reboot
 sudo ./install.sh --random-mask-domain --port 443 --install-awg --awg-port 443 --enable-firewall --auto-updates --yes
+```
+
+Add `--full-system-upgrade` to the prepare step only when you explicitly want `apt-get full-upgrade`:
+
+```bash
+sudo ./install.sh --prepare --full-system-upgrade --remove-existing --auto-updates --yes
 ```
 
 ## Mask domain selection

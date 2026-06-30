@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # install.sh — full production installer for Telegram MTProto proxy via mtg v2 FakeTLS
-# Optional: AmneziaWG VPN access, UFW firewall, automatic updates, two-stage reboot flow.
+# Optional: AmneziaWG VPN access, UFW firewall, automatic updates. Default flow is single-session without reboot.
 set -Eeuo pipefail
 
 tmp=""
@@ -141,17 +141,15 @@ usage() {
   cat <<EOF
 ${c_bld}MTG v2 FakeTLS MTProto proxy installer${c_reset}
 
-Recommended two-stage deployment:
+Recommended single-session deployment:
+  sudo ./install.sh --random-mask-domain --port 443 --install-awg --enable-firewall --auto-updates --remove-existing --yes
+
+Optional legacy two-stage deployment:
   sudo ./install.sh --full --random-mask-domain --port 443 --install-awg --enable-firewall --auto-updates --auto-reboot --remove-existing --yes
 
-If you do not want automatic reboot/resume:
-  sudo ./install.sh --prepare --remove-existing --auto-updates --yes
-  sudo reboot
-  sudo ./install.sh --mask-domain ya.ru --port 443 --install-awg --enable-firewall --auto-updates --yes
-
 Options:
-  --prepare             Prepare dependencies, optionally remove old MTProto, then reboot/exit
-  --full                Prepare first, then resume installation after reboot when --auto-reboot is set
+  --prepare             Prepare dependencies, optionally remove old MTProto, then exit
+  --full                Legacy two-stage mode: prepare first, then resume after reboot only when --auto-reboot is set
   --resume-install      Internal mode used by reboot-resume service
   --mask-domain <host>  FakeTLS/SNI mask domain, e.g. ya.ru
   --domain <host>       Legacy alias for --mask-domain
@@ -167,7 +165,7 @@ Options:
   --enable-firewall     Enable UFW: deny incoming; allow SSH, MTG TCP port, and AWG UDP port when enabled
   --auto-updates        Enable unattended system security updates + daily mtg update timer
   --full-system-upgrade Run apt-get full-upgrade during prepare phase. Optional; not default.
-  --auto-reboot         In --prepare/--full mode: install resume service and reboot automatically
+  --auto-reboot         Optional legacy mode: install resume service and reboot automatically
   --remove-existing     Remove known existing MTProto/MTG installs before installing
   -y, --yes             Non-interactive mode
   --update              Update only mtg binary, keep config
@@ -825,9 +823,9 @@ install_amneziawg() {
   select_awg_subnet
 
   require_free_space / 1200
-  cleanup_apt_caches
-  require_free_space / 1000
-  info "Installing AmneziaWG packages from official PPA"
+cleanup_apt_caches
+require_free_space / 1000
+info "Installing AmneziaWG packages from official PPA"
   apt_get_safe install -y software-properties-common python3-launchpadlib gnupg2 dkms "linux-headers-$(uname -r)" iptables qrencode
   add-apt-repository -y ppa:amnezia/ppa
   add-apt-repository -y --enable-source ppa:amnezia/ppa >/dev/null 2>&1 || true
@@ -982,8 +980,11 @@ do_update() {
 do_install() {
   require_root; detect_os; validate_ports; ensure_deps
   if [[ "$MODE" != "resume-install" && ! -f "$PREPARED_MARKER" ]]; then
-    warn "Prepare marker not found. Recommended: run --prepare and reboot before installation."
-    if [[ "$ASSUME_YES" -eq 0 ]] && confirm "Run prepare phase now?"; then do_prepare; fi
+    warn "Prepare marker not found. Running prepare phase in the current session; no reboot/resume will be used."
+    mkdir -p "$STATE_DIR"
+    prepare_system_packages
+    touch "$PREPARED_MARKER"
+    ok "Prepare phase completed in current session"
   fi
   handle_existing_mtproto
   local arch tag; arch="$(detect_arch)"; tag="$(resolve_version)"

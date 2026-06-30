@@ -11,7 +11,7 @@ AWG_SUBNET="${AWG_SUBNET:-}"
 
 INSTALL_AWG="${INSTALL_AWG:-1}"
 ENABLE_FIREWALL="${ENABLE_FIREWALL:-1}"
-AUTO_REBOOT="${AUTO_REBOOT:-1}"
+AUTO_REBOOT="${AUTO_REBOOT:-0}"
 AUTO_UPDATES="${AUTO_UPDATES:-1}"
 REMOVE_EXISTING="${REMOVE_EXISTING:-1}"
 FULL_SYSTEM_UPGRADE="${FULL_SYSTEM_UPGRADE:-0}"
@@ -33,7 +33,8 @@ Options:
   --awg-subnet CIDR         AmneziaWG subnet, e.g. 10.66.66.0/24
   --no-awg                  Do not install AmneziaWG
   --no-firewall             Do not enable UFW
-  --no-reboot               Do not auto-reboot after preparation
+  --auto-reboot             Legacy: allow auto-reboot/resume flow
+  --no-reboot               Compatibility option; default is already no auto-reboot
   --no-auto-updates         Do not configure automatic updates
   --full-system-upgrade     Run apt-get full-upgrade before installation (not default)
   --keep-existing           Do not remove existing MTProto/MTG installs
@@ -62,6 +63,8 @@ while [[ $# -gt 0 ]]; do
       INSTALL_AWG=0; shift ;;
     --no-firewall)
       ENABLE_FIREWALL=0; shift ;;
+    --auto-reboot)
+      AUTO_REBOOT=1; shift ;;
     --no-reboot)
       AUTO_REBOOT=0; shift ;;
     --no-auto-updates)
@@ -83,7 +86,7 @@ log "Downloading installer to ${INSTALLER_PATH}"
 curl -fsSL "${RAW_BASE}/install.sh" -o "${INSTALLER_PATH}"
 chmod +x "${INSTALLER_PATH}"
 
-args=(--full --port "${MTG_PORT}" --yes)
+args=(--port "${MTG_PORT}" --yes)
 
 if [[ -n "${MASK_DOMAIN}" ]]; then
   args+=(--mask-domain "${MASK_DOMAIN}")
@@ -107,6 +110,7 @@ if [[ "${AUTO_UPDATES}" == "1" ]]; then
 fi
 
 if [[ "${AUTO_REBOOT}" == "1" ]]; then
+  args=(--full "${args[@]}")
   args+=(--auto-reboot)
 fi
 
@@ -116,6 +120,12 @@ fi
 
 if [[ "${FULL_SYSTEM_UPGRADE}" == "1" ]]; then
   args+=(--full-system-upgrade)
+fi
+
+if [[ "${AUTO_REBOOT}" == "1" ]]; then
+  warn "Legacy auto-reboot mode enabled; SSH session will be interrupted."
+else
+  log "Single-session mode: no automatic reboot, no resume service."
 fi
 
 log "Running installer:"

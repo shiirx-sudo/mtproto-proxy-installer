@@ -1,8 +1,8 @@
-# mtproto-proxy-installer
+﻿# mtproto-proxy-installer
 
 ## Short automatic install
 
-Default production install: MTG on `443/tcp`, AmneziaWG on `443/udp`, UFW enabled, auto-updates enabled, old MTProto/MTG removed, random `MASK_DOMAIN` from the built-in list, auto-reboot enabled. It uses **minimal package preparation** by default and does not run `apt full-upgrade` unless `--full-system-upgrade` is explicitly set.
+Default production install: MTG on `443/tcp`, AmneziaWG on `443/udp`, UFW enabled, auto-updates enabled, old MTProto/MTG removed, random `MASK_DOMAIN` from the built-in list. It runs in the current SSH session by default: no automatic reboot and no resume service unless `--auto-reboot` is explicitly set. It uses **minimal package preparation** by default and does not run `apt full-upgrade` unless `--full-system-upgrade` is explicitly set.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/shiirx-sudo/mtproto-proxy-installer/main/quick-install.sh | sudo bash
@@ -32,6 +32,13 @@ curl -fsSL https://raw.githubusercontent.com/shiirx-sudo/mtproto-proxy-installer
   | sudo bash -s -- --no-awg
 ```
 
+Legacy auto-reboot/resume mode is still available, but it is not the default:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/shiirx-sudo/mtproto-proxy-installer/main/quick-install.sh \
+  | sudo bash -s -- --auto-reboot
+```
+
 Full manual installer remains available through `install.sh`.
 
 
@@ -41,7 +48,7 @@ Production installer for Telegram MTProto proxy through **MTG v2 FakeTLS** with 
 
 - Checks for existing MTProto/MTG services, Docker containers and configs.
 - Can remove old MTProto/MTG installs before deployment.
-- Supports two-stage deployment: OS update → reboot → MTG/AWG install.
+- Supports single-session deployment by default; optional legacy reboot/resume mode is available with `--auto-reboot`.
 - Installs MTG binary from GitHub release with SHA256 verification.
 - Runs MTG under a dedicated `mtg` system user through systemd.
 - Supports `MASK_DOMAIN`: your own FakeTLS/SNI domain, interactive selection, or random selection from a built-in list.
@@ -52,49 +59,31 @@ Production installer for Telegram MTProto proxy through **MTG v2 FakeTLS** with 
 
 ## Recommended install from GitHub
 
-Download the script first. This is better than `curl | bash`, because reboot-resume needs a local installer file.
+The shortest install path downloads the wrapper and runs the full deployment in the current SSH session:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/shiirx-sudo/mtproto-proxy-installer/main/install.sh -o /root/mtg-install.sh
-chmod +x /root/mtg-install.sh
-sudo /root/mtg-install.sh \
-  --full \
-  --random-mask-domain \
-  --port 443 \
-  --install-awg \
-  --awg-port 443 \
-  --enable-firewall \
-  --auto-updates \
-  --auto-reboot \
-  --remove-existing \
-  --yes
+curl -fsSL https://raw.githubusercontent.com/shiirx-sudo/mtproto-proxy-installer/main/quick-install.sh | sudo bash
 ```
 
 With your own mask domain and AWG subnet:
 
 ```bash
-sudo /root/mtg-install.sh \
-  --full \
-  --mask-domain ya.ru \
-  --port 443 \
-  --install-awg \
-  --awg-port 443 \
-  --awg-subnet 10.66.66.0/24 \
-  --enable-firewall \
-  --auto-updates \
-  --auto-reboot \
-  --remove-existing \
-  --yes
+curl -fsSL https://raw.githubusercontent.com/shiirx-sudo/mtproto-proxy-installer/main/quick-install.sh \
+  | sudo bash -s -- --mask-domain ya.ru --awg-subnet 10.66.66.0/24
 ```
 
 `--domain` is kept as a legacy alias for `--mask-domain`.
 
-## Manual two-stage install
+## Manual install
 
 ```bash
-sudo ./install.sh --prepare --remove-existing --auto-updates --yes
-sudo reboot
-sudo ./install.sh --random-mask-domain --port 443 --install-awg --awg-port 443 --enable-firewall --auto-updates --yes
+sudo ./install.sh --random-mask-domain --port 443 --install-awg --awg-port 443 --enable-firewall --auto-updates --remove-existing --yes
+```
+
+Legacy two-stage install remains available when a reboot/resume flow is explicitly wanted:
+
+```bash
+sudo ./install.sh --full --random-mask-domain --port 443 --install-awg --awg-port 443 --enable-firewall --auto-updates --auto-reboot --remove-existing --yes
 ```
 
 ## Mask domain selection
@@ -229,3 +218,26 @@ E: Unable to locate package amneziawg
 ```
 
 where the real cause is that APT could not write repository indexes after the disk filled up.
+
+
+## v10 note вЂ” no automatic reboot by default
+
+`quick-install.sh` now uses a single-session flow by default:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/shiirx-sudo/mtproto-proxy-installer/main/quick-install.sh | sudo bash
+```
+
+Default behavior:
+
+- no automatic reboot;
+- no `mtg-installer-resume.service`;
+- package preparation runs in the same SSH session;
+- MTG/AWG/firewall/auto-update setup continues immediately after preparation.
+
+The old two-stage reboot/resume behavior is still available explicitly:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/shiirx-sudo/mtproto-proxy-installer/main/quick-install.sh \
+  | sudo bash -s -- --auto-reboot
+```
